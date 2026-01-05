@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tos-bridge"
+version = "0.1.0"
+description = "MCP Server bridging Claude to VPS-hosted Token Optimization System (Qdrant + Neo4j)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Vanya", email = "vanya@ethospower.org" }
+]
+keywords = ["mcp", "claude", "qdrant", "neo4j", "token-optimization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "fastmcp>=2.0.0",
+    "qdrant-client>=1.7.0",
+    "neo4j>=5.0.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+tos-bridge = "tos_bridge.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/No-Smoke/tos-bridge"
+Repository = "https://github.com/No-Smoke/tos-bridge"
+Issues = "https://github.com/No-Smoke/tos-bridge/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tos_bridge"]
