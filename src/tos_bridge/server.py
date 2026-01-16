@@ -17,6 +17,13 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 from neo4j import GraphDatabase
 from pydantic import BaseModel, Field
 
+# Import graph-enhanced tools
+from .graph_tools import (
+    store_document_with_graph,
+    graph_enhanced_search,
+    find_related_documents
+)
+
 
 # Configuration from environment
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -242,6 +249,106 @@ async def check_tos_health() -> Dict[str, Any]:
         health["status"] = "degraded"
     
     return health
+
+
+# ============================================================================
+# Register Graph-Enhanced Tools
+# ============================================================================
+
+@mcp.tool()
+async def store_doc_with_graph(
+    text: str,
+    collection: str,
+    title: str,
+    path: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    entities: Optional[List[Dict[str, Any]]] = None,
+    relationships: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """
+    Store document in Qdrant with Neo4j graph cross-reference.
+    
+    Args:
+        text: Document content for embedding
+        collection: Qdrant collection name
+        title: Document title
+        path: Optional file path
+        summary: Optional brief summary
+        metadata: Additional metadata for Qdrant
+        entities: List of entities [{name, type, importance}]
+        relationships: List of relationships [{target, rel_type, context}]
+    
+    Returns:
+        qdrant_id, neo4j_id, entities_created, relationships_created
+    """
+    return await store_document_with_graph(
+        text=text,
+        collection=collection,
+        title=title,
+        path=path,
+        summary=summary,
+        metadata=metadata,
+        entities=entities,
+        relationships=relationships
+    )
+
+
+@mcp.tool()
+async def search_with_graph(
+    query: str,
+    collection: str,
+    limit: int = 10,
+    relationship_boost: float = 0.2,
+    include_graph_context: bool = True
+) -> Dict[str, Any]:
+    """
+    Graph-enhanced semantic search combining Qdrant vectors with Neo4j relationships.
+    
+    Args:
+        query: Search query text
+        collection: Qdrant collection to search
+        limit: Maximum results to return
+        relationship_boost: Score boost for graph-connected docs (0.0-0.5)
+        include_graph_context: Include entity connections in results
+    
+    Returns:
+        Reranked results with graph context
+    """
+    return await graph_enhanced_search(
+        query=query,
+        collection=collection,
+        limit=limit,
+        relationship_boost=relationship_boost,
+        include_graph_context=include_graph_context
+    )
+
+
+@mcp.tool()
+async def find_related_docs(
+    qdrant_id: str,
+    max_depth: int = 2,
+    limit: int = 10,
+    include_paths: bool = True
+) -> Dict[str, Any]:
+    """
+    Find documents related to a given document via Neo4j graph traversal.
+    
+    Args:
+        qdrant_id: Source document's Qdrant UUID
+        max_depth: Maximum traversal depth (1-3)
+        limit: Maximum related documents
+        include_paths: Include relationship paths in results
+    
+    Returns:
+        Related documents with relationship context
+    """
+    return await find_related_documents(
+        qdrant_id=qdrant_id,
+        max_depth=max_depth,
+        limit=limit,
+        include_paths=include_paths
+    )
 
 
 if __name__ == "__main__":
