@@ -7,6 +7,8 @@ Enables pattern extraction from Projects and synchronization to remote memory sy
 
 import os
 import json
+import logging
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -21,8 +23,16 @@ from pydantic import BaseModel, Field
 from .graph_tools import (
     store_document_with_graph,
     graph_enhanced_search,
-    find_related_documents
+    find_related_documents,
+    neo4j_session
 )
+
+# Set up structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("tos-bridge")
 
 
 # Configuration from environment
@@ -51,18 +61,58 @@ class TOSHealth(BaseModel):
     last_sync: Optional[str] = None
 
 
+# Circuit Breaker for external services
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, reset_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "closed"  # closed, open, half-open
+
+    def call(self, func, *args, **kwargs):
+        if self.state == "open":
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "half-open"
+                logger.info(f"Circuit breaker half-open for {func.__name__}")
+            else:
+                raise Exception(f"Circuit breaker open for {func.__name__}")
+
+        try:
+            result = func(*args, **kwargs)
+            if self.state == "half-open":
+                self.state = "closed"
+                self.failure_count = 0
+                logger.info(f"Circuit breaker closed for {func.__name__}")
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+
+            if self.failure_count >= self.failure_threshold:
+                self.state = "open"
+                logger.error(f"Circuit breaker opened for {func.__name__} after {self.failure_count} failures")
+
+            raise e
+
+# Initialize circuit breakers
+qdrant_circuit_breaker = CircuitBreaker()
+neo4j_circuit_breaker = CircuitBreaker()
+
 # Initialize FastMCP server
 mcp = FastMCP("tos-bridge")
 
 
 # Client initialization helpers
 def get_qdrant_client() -> QdrantClient:
-    """Initialize Qdrant client with API key"""
-    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)  # FIXED: Pass api_key
+    """Initialize Qdrant client with API key and circuit breaker protection"""
+    def _create_client():
+        return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    return qdrant_circuit_breaker.call(_create_client)
 
 
 def get_neo4j_driver():
-    """Initialize Neo4j driver"""
+    """Legacy sync method - deprecated, use neo4j_session() from graph_tools"""
     if not NEO4J_PASSWORD:
         raise ValueError("NEO4J_PASSWORD environment variable required")
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
@@ -115,36 +165,42 @@ async def sync_to_tos(
             }
         
         if target in ["neo4j", "both"]:
-            driver = get_neo4j_driver()
-            
-            with driver.session() as session:
-                # Create Pattern nodes and relationships
-                result = session.run("""
-                    UNWIND $patterns AS pattern
-                    MERGE (p:Pattern {text: pattern.text})
-                    SET p.source = pattern.source,
-                        p.category = pattern.category,
-                        p.importance = pattern.importance,
-                        p.synced_at = pattern.synced_at
-                    RETURN count(p) as created
-                """, patterns=[
-                    {
-                        "text": p.get("text", ""),
-                        "source": p.get("source", "unknown"),
-                        "category": p.get("category", "general"),
-                        "importance": p.get("importance", 0.5),
-                        "synced_at": datetime.utcnow().isoformat()
+            try:
+                async with neo4j_session() as session:
+                    # Create Pattern nodes and relationships
+                    result = session.run("""
+                        UNWIND $patterns AS pattern
+                        MERGE (p:Pattern {text: pattern.text})
+                        SET p.source = pattern.source,
+                            p.category = pattern.category,
+                            p.importance = pattern.importance,
+                            p.synced_at = pattern.synced_at
+                        RETURN count(p) as created
+                    """, patterns=[
+                        {
+                            "text": p.get("text", ""),
+                            "source": p.get("source", "unknown"),
+                            "category": p.get("category", "general"),
+                            "importance": p.get("importance", 0.5),
+                            "synced_at": datetime.utcnow().isoformat()
+                        }
+                        for p in patterns
+                    ])
+
+                    created = result.single()["created"]
+                    results["neo4j"] = {
+                        "nodes_created": created,
+                        "timestamp": datetime.utcnow().isoformat()
                     }
-                    for p in patterns
-                ])
-                
-                created = result.single()["created"]
+                    logger.info(f"Successfully synced {created} patterns to Neo4j")
+
+            except Exception as e:
+                logger.error(f"Neo4j sync failed: {e}")
                 results["neo4j"] = {
-                    "nodes_created": created,
+                    "status": "error",
+                    "error": str(e),
                     "timestamp": datetime.utcnow().isoformat()
                 }
-            
-            driver.close()
         
         return results
         
@@ -202,42 +258,44 @@ async def check_tos_health() -> Dict[str, Any]:
     
     # Check Neo4j
     try:
-        driver = get_neo4j_driver()
         start = datetime.utcnow()
-        
-        with driver.session() as session:
+
+        async with neo4j_session() as session:
             result = session.run("""
                 MATCH (n)
                 RETURN labels(n)[0] as label, count(n) as node_count
             """)
-            
+
             latency = (datetime.utcnow() - start).total_seconds() * 1000
-            
+
             node_counts = {}
             for record in result:
                 label = record["label"] or "unlabeled"
                 node_counts[label] = record["node_count"]
-            
+
             # Get relationship counts
             rel_result = session.run("""
                 MATCH ()-[r]->()
                 RETURN count(r) as rel_count
             """)
             rel_count = rel_result.single()["rel_count"]
-        
-        driver.close()
-        
+
         health["neo4j"] = {
             "status": "healthy",
             "latency_ms": round(latency, 2),
             "nodes": node_counts,
             "relationships": rel_count,
-            "uri": NEO4J_URI
+            "uri": NEO4J_URI,
+            "connection_pool": "enabled"
         }
+        logger.info(f"Neo4j health check passed - latency: {latency:.2f}ms")
+
     except Exception as e:
+        logger.error(f"Neo4j health check failed: {e}")
         health["neo4j"] = {
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "uri": NEO4J_URI
         }
     
     # Overall status

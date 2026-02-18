@@ -13,12 +13,16 @@ Requires:
 """
 import os
 import uuid
+import asyncio
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from neo4j import GraphDatabase
+from neo4j.exceptions import ServiceUnavailable, TransientError
 
 from .embedding import get_embedding
 
@@ -29,14 +33,85 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
+# Global connection pool
+_neo4j_driver = None
+_last_health_check = 0
+_health_check_interval = 60  # seconds
+
 
 def get_qdrant_client() -> QdrantClient:
     """Initialize Qdrant client with API key."""
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
+async def get_neo4j_driver_with_retry(max_retries: int = 3):
+    """Get Neo4j driver with exponential backoff retry."""
+    global _neo4j_driver, _last_health_check
+
+    current_time = time.time()
+
+    # Check if we need to verify connection health
+    if (_neo4j_driver is None or
+        current_time - _last_health_check > _health_check_interval):
+
+        for attempt in range(max_retries):
+            try:
+                if _neo4j_driver is None:
+                    if not NEO4J_PASSWORD:
+                        raise ValueError("NEO4J_PASSWORD environment variable required")
+                    _neo4j_driver = GraphDatabase.driver(
+                        NEO4J_URI,
+                        auth=(NEO4J_USER, NEO4J_PASSWORD),
+                        max_connection_lifetime=300,  # 5 minutes
+                        max_connection_pool_size=10,
+                        connection_timeout=20
+                    )
+
+                # Health check
+                with _neo4j_driver.session() as session:
+                    session.run("RETURN 1 as test").single()
+
+                _last_health_check = current_time
+                return _neo4j_driver
+
+            except (ServiceUnavailable, TransientError) as e:
+                if attempt == max_retries - 1:
+                    raise e
+
+                # Exponential backoff: 1s, 2s, 4s
+                wait_time = 2 ** attempt
+                print(f"Neo4j connection failed, retrying in {wait_time}s... ({e})")
+                await asyncio.sleep(wait_time)
+
+                # Reset driver on failure
+                if _neo4j_driver:
+                    try:
+                        _neo4j_driver.close()
+                    except:
+                        pass
+                    _neo4j_driver = None
+
+    return _neo4j_driver
+
+
+@asynccontextmanager
+async def neo4j_session():
+    """Async context manager for Neo4j sessions with auto-recovery."""
+    driver = await get_neo4j_driver_with_retry()
+    session = driver.session()
+    try:
+        yield session
+    except Exception as e:
+        # Reset connection on error
+        global _neo4j_driver, _last_health_check
+        _last_health_check = 0  # Force health check on next use
+        raise e
+    finally:
+        session.close()
+
+
 def get_neo4j_driver():
-    """Initialize Neo4j driver."""
+    """Legacy sync method - deprecated, use get_neo4j_driver_with_retry()."""
     if not NEO4J_PASSWORD:
         raise ValueError("NEO4J_PASSWORD environment variable required")
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
@@ -104,10 +179,9 @@ async def store_document_with_graph(
         )
         
         # 4. Create Neo4j Document node and relationships
-        driver = get_neo4j_driver()
         neo4j_result = {}
-        
-        with driver.session() as session:
+
+        async with neo4j_session() as session:
             # Create Document node
             doc_result = session.run("""
                 CREATE (d:Document {
@@ -128,7 +202,7 @@ async def store_document_with_graph(
                 "summary": doc_summary
             })
             neo4j_result["neo4j_id"] = doc_result.single()["neo4j_id"]
-            
+
             # Create entities and MENTIONS relationships
             entities_created = 0
             for entity in (entities or []):
@@ -145,7 +219,7 @@ async def store_document_with_graph(
                     "importance": entity.get("importance", 0.5)
                 })
                 entities_created += 1
-            
+
             # Create additional relationships
             rels_created = 0
             for rel in (relationships or []):
@@ -162,8 +236,6 @@ async def store_document_with_graph(
                     "context": rel.get("context")
                 })
                 rels_created += 1
-        
-        driver.close()
         
         return {
             "status": "success",
@@ -246,17 +318,15 @@ async def graph_enhanced_search(
         qdrant_ids = list(results_map.keys())
         
         # 4. Query Neo4j for graph relationships
-        driver = get_neo4j_driver()
-        
-        with driver.session() as session:
+        async with neo4j_session() as session:
             # Find entities connected to our documents
             entity_result = session.run("""
                 MATCH (d:Document)-[r:MENTIONS|REFERENCES]->(e:Entity)
                 WHERE d.qdrant_id IN $qdrant_ids
-                RETURN d.qdrant_id as doc_id, 
+                RETURN d.qdrant_id as doc_id,
                        collect(DISTINCT e.name) as entities
             """, {"qdrant_ids": qdrant_ids})
-            
+
             doc_entities = {}
             all_entities = set()
             for record in entity_result:
@@ -264,7 +334,7 @@ async def graph_enhanced_search(
                 entities = record["entities"]
                 doc_entities[doc_id] = entities
                 all_entities.update(entities)
-            
+
             # Find OTHER documents connected to same entities (graph expansion)
             if all_entities:
                 expanded_result = session.run("""
@@ -287,13 +357,13 @@ async def graph_enhanced_search(
                     "exclude_ids": qdrant_ids,
                     "limit": limit
                 })
-                
+
                 # Add graph-discovered documents
                 for record in expanded_result:
                     doc_id = record["qdrant_id"]
                     entity_count = record["entity_count"]
                     graph_score = min(0.9, 0.5 + (entity_count * 0.1))
-                    
+
                     results_map[doc_id] = {
                         "qdrant_id": doc_id,
                         "score": graph_score,
@@ -305,15 +375,13 @@ async def graph_enhanced_search(
                         "graph_connections": record["shared_entities"],
                         "discovered_via_graph": True
                     }
-            
+
             # Apply relationship boost to original results
             for doc_id, entities in doc_entities.items():
                 if doc_id in results_map:
                     connection_boost = min(relationship_boost, len(entities) * 0.05)
                     results_map[doc_id]["boosted_score"] += connection_boost
                     results_map[doc_id]["graph_connections"] = entities
-        
-        driver.close()
         
         # 5. Rerank by boosted score
         sorted_results = sorted(
@@ -380,28 +448,27 @@ async def find_related_documents(
         Related documents with relationship context
     """
     try:
-        driver = get_neo4j_driver()
         related_docs = []
-        
-        with driver.session() as session:
+
+        async with neo4j_session() as session:
             # Verify source document exists
             source_check = session.run("""
                 MATCH (d:Document {qdrant_id: $qdrant_id})
                 RETURN d.title as title, d.qdrant_collection as collection
             """, {"qdrant_id": qdrant_id})
-            
+
             source_record = source_check.single()
             if not source_record:
                 return {
                     "status": "error",
                     "error": f"Document not found: {qdrant_id}"
                 }
-            
+
             source_info = {
                 "title": source_record["title"],
                 "collection": source_record["collection"]
             }
-            
+
             # Graph traversal - find related documents through shared entities
             traversal_query = f"""
                 MATCH path = (source:Document {{qdrant_id: $qdrant_id}})
@@ -422,12 +489,12 @@ async def find_related_documents(
                 ORDER BY distance, size(shared_entities) DESC
                 LIMIT $limit
             """
-            
+
             result = session.run(traversal_query, {
                 "qdrant_id": qdrant_id,
                 "limit": limit
             })
-            
+
             for record in result:
                 doc = {
                     "qdrant_id": record["qdrant_id"],
@@ -441,8 +508,6 @@ async def find_related_documents(
                 if include_paths:
                     doc["relationship_types"] = record["rel_types"]
                 related_docs.append(doc)
-        
-        driver.close()
         
         return {
             "status": "success",
