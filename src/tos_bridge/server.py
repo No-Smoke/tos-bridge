@@ -7,6 +7,7 @@ Enables pattern extraction from Projects and synchronization to remote memory sy
 
 import os
 import json
+import uuid
 import logging
 import time
 from datetime import datetime
@@ -24,8 +25,12 @@ from .graph_tools import (
     store_document_with_graph,
     graph_enhanced_search,
     find_related_documents,
+    manage_entities,
+    manage_relationships,
+    search_entities,
     neo4j_session
 )
+from .embedding import get_embedding, warmup_ollama
 
 # Set up structured logging
 logging.basicConfig(
@@ -142,24 +147,33 @@ async def sync_to_tos(
     
     try:
         if target in ["qdrant", "both"]:
-            qdrant_client = get_qdrant_client()
-            
-            # Prepare points for batch storage
-            texts = [p.get("text", "") for p in patterns]
-            metadatas = [
-                {
+            from .graph_tools import get_qdrant_client as gt_qdrant, _get_collection_vector_name
+            qdrant_client = gt_qdrant()
+            vector_name = _get_collection_vector_name(qdrant_client, collection)
+
+            points = []
+            for p in patterns:
+                text = p.get("text", "")
+                if not text:
+                    continue
+                embedding = await get_embedding(text)
+                point_id = str(uuid.uuid4())
+                payload = {
+                    "title": p.get("source", "pattern"),
+                    "summary": text[:200],
                     "source": p.get("source", "unknown"),
                     "category": p.get("category", "general"),
                     "importance": p.get("importance", 0.5),
                     "synced_at": datetime.utcnow().isoformat()
                 }
-                for p in patterns
-            ]
-            
-            # Note: Using qdrant-mcp-remote's batch_store would be better
-            # For now, placeholder showing the structure
+                point_vector = {vector_name: embedding} if vector_name else embedding
+                points.append(PointStruct(id=point_id, vector=point_vector, payload=payload))
+
+            if points:
+                qdrant_client.upsert(collection_name=collection, points=points)
+
             results["qdrant"] = {
-                "stored": len(patterns),
+                "stored": len(points),
                 "collection": collection,
                 "timestamp": datetime.utcnow().isoformat()
             }
@@ -406,6 +420,84 @@ async def find_related_docs(
         max_depth=max_depth,
         limit=limit,
         include_paths=include_paths
+    )
+
+
+# ============================================================================
+# Entity & Relationship Management Tools (chat-completion parity)
+# ============================================================================
+
+@mcp.tool()
+async def create_or_update_entities(
+    entities: List[Dict[str, Any]],
+    check_existing: bool = True
+) -> Dict[str, Any]:
+    """
+    Create or update entities in Neo4j with observations.
+    Replaces neo4j-memory-remote:create_entities + add_observations.
+    
+    Args:
+        entities: List of entity dicts, each with:
+            - name (str, required): Entity name
+            - type (str): Entity type e.g. "project", "tool", "person", "concept"
+            - observations (list[str]): Facts about this entity
+        check_existing: If True, MERGE (dedup); if False, always CREATE
+    
+    Returns:
+        Dict with created, updated, and total counts
+    """
+    return await manage_entities(
+        entities=entities,
+        check_existing=check_existing
+    )
+
+
+@mcp.tool()
+async def create_relationships(
+    relationships: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Create relationships between entities in Neo4j.
+    Replaces neo4j-memory-remote:create_relations.
+    
+    Args:
+        relationships: List of relationship dicts, each with:
+            - from_entity (str, required): Source entity name
+            - to_entity (str, required): Target entity name
+            - rel_type (str): e.g. "USES", "DEPENDS_ON", "PART_OF", "RELATES_TO"
+            - context (str): Optional description of the relationship
+    
+    Returns:
+        Dict with created count
+    """
+    return await manage_relationships(
+        relationships=relationships
+    )
+
+
+@mcp.tool()
+async def find_entities(
+    query: str,
+    entity_type: Optional[str] = None,
+    limit: int = 20
+) -> Dict[str, Any]:
+    """
+    Search for entities in Neo4j by name substring match.
+    Use for deduplication before creating new entities.
+    Replaces neo4j-memory-remote:search_memories + find_memories_by_name.
+    
+    Args:
+        query: Search string (case-insensitive substring match on name)
+        entity_type: Optional filter by type (e.g. "project", "tool")
+        limit: Maximum results (default 20)
+    
+    Returns:
+        Matching entities with observations and document references
+    """
+    return await search_entities(
+        query=query,
+        entity_type=entity_type,
+        limit=limit
     )
 
 

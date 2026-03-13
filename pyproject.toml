@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tos-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP Server bridging Claude to VPS-hosted Token Optimization System (Qdrant + Neo4j)"
 readme = "README.md"
 license = "MIT"
