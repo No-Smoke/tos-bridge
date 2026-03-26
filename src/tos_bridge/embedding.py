@@ -56,12 +56,32 @@ class EmbeddingCircuitBreaker:
 embedding_circuit_breaker = EmbeddingCircuitBreaker()
 
 
+def _truncate_for_embedding(text: str, max_chars: int = 1800) -> str:
+    """
+    Truncate text to fit within mxbai-embed-large's 512-token context.
+    
+    BERT tokenizers average ~4 chars/token. 1800 chars ≈ 450 tokens,
+    leaving headroom for special tokens ([CLS], [SEP]).
+    Truncates at word boundary to avoid splitting mid-word.
+    """
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    # Cut at last space to preserve word boundaries
+    last_space = truncated.rfind(" ")
+    if last_space > max_chars * 0.8:
+        truncated = truncated[:last_space]
+    logger.debug(f"Truncated embedding input from {len(text)} to {len(truncated)} chars")
+    return truncated
+
+
 async def _get_embedding_raw(
     text: str,
     model: str,
-    timeout: float = 30.0
+    timeout: float = 60.0
 ) -> List[float]:
     """Raw embedding function without circuit breaker (internal use)."""
+    text = _truncate_for_embedding(text)
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{OLLAMA_URL}/api/embeddings",
@@ -78,8 +98,8 @@ async def _get_embedding_raw(
 async def get_embedding(
     text: str,
     model: Optional[str] = None,
-    timeout: float = 30.0,
-    max_retries: int = 3
+    timeout: float = 60.0,
+    max_retries: int = 5
 ) -> List[float]:
     """
     Generate embedding using Ollama with circuit breaker and retry logic.
@@ -121,7 +141,7 @@ async def get_embedding(
 async def get_embeddings_batch(
     texts: List[str],
     model: Optional[str] = None,
-    timeout: float = 30.0
+    timeout: float = 60.0
 ) -> List[List[float]]:
     """
     Generate embeddings for multiple texts.
@@ -147,7 +167,7 @@ async def get_embeddings_batch(
 def get_embedding_sync(
     text: str,
     model: Optional[str] = None,
-    timeout: float = 30.0
+    timeout: float = 60.0
 ) -> List[float]:
     """
     Synchronous version of get_embedding.
@@ -161,6 +181,7 @@ def get_embedding_sync(
         Embedding vector
     """
     model = model or OLLAMA_EMBED_MODEL
+    text = _truncate_for_embedding(text)
     
     with httpx.Client(timeout=timeout) as client:
         response = client.post(
@@ -172,3 +193,41 @@ def get_embedding_sync(
         )
         response.raise_for_status()
         return response.json()["embedding"]
+
+
+async def warmup_ollama(model: Optional[str] = None) -> bool:
+    """
+    Pre-warm Ollama by loading the embedding model into memory.
+    
+    Sends a trivial embedding request on startup so the model is
+    already loaded when real requests arrive. Cold loads on NUC
+    can take 10-15s, causing timeouts on first real request.
+    
+    Returns:
+        True if warmup succeeded, False otherwise
+    """
+    model = model or OLLAMA_EMBED_MODEL
+    
+    try:
+        # First check Ollama is reachable
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            health = await client.get(f"{OLLAMA_URL}/api/tags")
+            health.raise_for_status()
+            logger.info(f"Ollama reachable at {OLLAMA_URL}")
+        
+        # Send a trivial embedding to force model load
+        logger.info(f"Warming up Ollama model '{model}'...")
+        embedding = await _get_embedding_raw("warmup", model, timeout=120.0)
+        dim = len(embedding)
+        logger.info(f"Ollama warmup complete — model '{model}' loaded ({dim}-dim embeddings)")
+        
+        # Reset circuit breaker to clean state after warmup
+        embedding_circuit_breaker.state = "closed"
+        embedding_circuit_breaker.failure_count = 0
+        embedding_circuit_breaker.last_failure_time = None
+        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"Ollama warmup failed (non-fatal): {e}")
+        return False
