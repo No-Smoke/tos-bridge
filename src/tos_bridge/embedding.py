@@ -20,7 +20,7 @@ OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 
 # Circuit breaker for Ollama
 class EmbeddingCircuitBreaker:
-    def __init__(self, failure_threshold: int = 3, reset_timeout: int = 30):
+    def __init__(self, failure_threshold: int = 8, reset_timeout: int = 120):
         self.failure_threshold = failure_threshold
         self.reset_timeout = reset_timeout
         self.failure_count = 0
@@ -118,22 +118,48 @@ async def get_embedding(
     """
     model = model or OLLAMA_EMBED_MODEL
 
+    # Check circuit breaker state before entering retry loop.
+    # This prevents retries from cascading into breaker trips —
+    # the breaker only counts one failure per top-level call,
+    # not one per retry attempt.
+    if embedding_circuit_breaker.state == "open":
+        if embedding_circuit_breaker.last_failure_time and \
+           time.time() - embedding_circuit_breaker.last_failure_time > embedding_circuit_breaker.reset_timeout:
+            embedding_circuit_breaker.state = "half-open"
+            logger.info("Embedding circuit breaker half-open (pre-retry check)")
+        else:
+            raise Exception("Embedding service circuit breaker open - too many failures")
+
+    last_error = None
     for attempt in range(max_retries):
         try:
-            result = await embedding_circuit_breaker.call(
-                _get_embedding_raw, text, model, timeout
-            )
+            result = await _get_embedding_raw(text, model, timeout)
+            # Success — reset breaker if it was half-open
+            if embedding_circuit_breaker.state == "half-open":
+                embedding_circuit_breaker.state = "closed"
+                embedding_circuit_breaker.failure_count = 0
+                logger.info("Embedding circuit breaker closed - service recovered")
+            elif embedding_circuit_breaker.failure_count > 0:
+                # Successful call after some failures — decay the counter
+                embedding_circuit_breaker.failure_count = max(0, embedding_circuit_breaker.failure_count - 1)
             if attempt > 0:
                 logger.info(f"Embedding succeeded on retry {attempt}")
             return result
 
         except Exception as e:
+            last_error = e
             if attempt == max_retries - 1:
+                # All retries exhausted — NOW record one failure on the breaker
+                embedding_circuit_breaker.failure_count += 1
+                embedding_circuit_breaker.last_failure_time = time.time()
+                if embedding_circuit_breaker.failure_count >= embedding_circuit_breaker.failure_threshold:
+                    embedding_circuit_breaker.state = "open"
+                    logger.error(f"Embedding circuit breaker opened after {embedding_circuit_breaker.failure_count} top-level failures")
                 logger.error(f"Embedding failed after {max_retries} attempts: {e}")
                 raise e
 
-            # Exponential backoff: 1s, 2s, 4s
-            wait_time = 2 ** attempt
+            # Exponential backoff: 1s, 2s, 4s, 8s
+            wait_time = min(2 ** attempt, 8)
             logger.warning(f"Embedding attempt {attempt + 1} failed, retrying in {wait_time}s: {e}")
             await asyncio.sleep(wait_time)
 
