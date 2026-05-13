@@ -8,9 +8,10 @@ Enables pattern extraction from Projects and synchronization to remote memory sy
 import os
 import json
 import uuid
+import hashlib
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 import httpx
@@ -28,9 +29,22 @@ from .graph_tools import (
     manage_entities,
     manage_relationships,
     search_entities,
-    neo4j_session
+    neo4j_session,
+    _run_cypher,
+    _utcnow_iso,
 )
 from .embedding import get_embedding, warmup_ollama
+
+
+def _pattern_key(text: str, source: str) -> str:
+    """Deterministic hash key for a Pattern node.
+
+    MERGE-ing on raw `text` causes any pattern with the same text from a
+    different source to clobber each other's metadata. Hash (source||text)
+    so same-text-different-source patterns stay distinct.
+    """
+    h = hashlib.sha256(f"{source}\x00{text}".encode("utf-8")).hexdigest()
+    return h
 
 # Set up structured logging
 logging.basicConfig(
@@ -143,87 +157,98 @@ async def sync_to_tos(
     Returns:
         Sync status and counts
     """
-    results = {"status": "success", "qdrant": None, "neo4j": None}
-    
-    try:
-        if target in ["qdrant", "both"]:
-            from .graph_tools import get_qdrant_client as gt_qdrant, _get_collection_vector_name
-            qdrant_client = gt_qdrant()
-            vector_name = _get_collection_vector_name(qdrant_client, collection)
+    results: Dict[str, Any] = {"status": "success", "qdrant": None, "neo4j": None}
 
-            points = []
-            for p in patterns:
-                text = p.get("text", "")
-                if not text:
-                    continue
-                embedding = await get_embedding(text)
-                point_id = str(uuid.uuid4())
-                payload = {
-                    "title": p.get("source", "pattern"),
-                    "summary": text[:200],
-                    "source": p.get("source", "unknown"),
-                    "category": p.get("category", "general"),
-                    "importance": p.get("importance", 0.5),
-                    "synced_at": datetime.utcnow().isoformat()
-                }
-                point_vector = {vector_name: embedding} if vector_name else embedding
-                points.append(PointStruct(id=point_id, vector=point_vector, payload=payload))
+    # Qdrant write — any failure propagates (no silent error swallow).
+    if target in ("qdrant", "both"):
+        from .graph_tools import get_qdrant_client as gt_qdrant, _get_collection_vector_name
+        qdrant_client = gt_qdrant()
+        vector_name = _get_collection_vector_name(qdrant_client, collection)
 
-            if points:
-                qdrant_client.upsert(collection_name=collection, points=points)
-
-            results["qdrant"] = {
-                "stored": len(points),
-                "collection": collection,
-                "timestamp": datetime.utcnow().isoformat()
+        points = []
+        for p in patterns:
+            text = p.get("text", "")
+            if not text:
+                continue
+            embedding = await get_embedding(text)
+            source = p.get("source", "unknown")
+            # Use uuid5 from the same hash so Qdrant + Neo4j stay in lockstep —
+            # re-syncing the same (source, text) updates the same point.
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, _pattern_key(text, source)))
+            payload = {
+                "title": source,
+                "summary": text[:200],
+                "source": source,
+                "category": p.get("category", "general"),
+                "importance": p.get("importance", 0.5),
+                "synced_at": _utcnow_iso(),
             }
-        
-        if target in ["neo4j", "both"]:
-            try:
-                async with neo4j_session() as session:
-                    # Create Pattern nodes and relationships
-                    result = session.run("""
-                        UNWIND $patterns AS pattern
-                        MERGE (p:Pattern {text: pattern.text})
-                        SET p.source = pattern.source,
-                            p.category = pattern.category,
-                            p.importance = pattern.importance,
-                            p.synced_at = pattern.synced_at
-                        RETURN count(p) as created
-                    """, patterns=[
-                        {
-                            "text": p.get("text", ""),
-                            "source": p.get("source", "unknown"),
-                            "category": p.get("category", "general"),
-                            "importance": p.get("importance", 0.5),
-                            "synced_at": datetime.utcnow().isoformat()
-                        }
-                        for p in patterns
-                    ])
+            point_vector = {vector_name: embedding} if vector_name else embedding
+            points.append(PointStruct(id=point_id, vector=point_vector, payload=payload))
 
-                    created = result.single()["created"]
-                    results["neo4j"] = {
-                        "nodes_created": created,
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                    logger.info(f"Successfully synced {created} patterns to Neo4j")
+        if points:
+            qdrant_client.upsert(collection_name=collection, points=points)
 
-            except Exception as e:
-                logger.error(f"Neo4j sync failed: {e}")
-                results["neo4j"] = {
-                    "status": "error",
-                    "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-        
-        return results
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
+        results["qdrant"] = {
+            "stored": len(points),
+            "collection": collection,
+            "timestamp": _utcnow_iso(),
         }
+
+    # Neo4j write — wrap so Qdrant partial success can still be reported.
+    # This is the ONE legitimate place where we capture an exception to a
+    # status field instead of re-raising: it's a deliberate multi-store
+    # partial-success contract, not silent swallowing.
+    if target in ("neo4j", "both"):
+        try:
+            async with neo4j_session() as session:
+                # MERGE on a deterministic hash so same-text-different-source
+                # patterns don't clobber each other.
+                payload_rows = [
+                    {
+                        "hash": _pattern_key(p.get("text", ""), p.get("source", "unknown")),
+                        "text": p.get("text", ""),
+                        "source": p.get("source", "unknown"),
+                        "category": p.get("category", "general"),
+                        "importance": p.get("importance", 0.5),
+                        "synced_at": _utcnow_iso(),
+                    }
+                    for p in patterns
+                    if p.get("text")
+                ]
+                rows = await _run_cypher(session, """
+                    UNWIND $patterns AS pattern
+                    MERGE (p:Pattern {hash: pattern.hash})
+                    ON CREATE SET p.text = pattern.text,
+                                  p.source = pattern.source,
+                                  p.category = pattern.category,
+                                  p.importance = pattern.importance,
+                                  p.synced_at = pattern.synced_at,
+                                  p.created_at = datetime()
+                    ON MATCH SET p.importance = pattern.importance,
+                                 p.category = pattern.category,
+                                 p.synced_at = pattern.synced_at,
+                                 p.updated_at = datetime()
+                    RETURN count(p) AS touched
+                """, {"patterns": payload_rows})
+
+                touched = rows[0]["touched"] if rows else 0
+                results["neo4j"] = {
+                    "nodes_touched": touched,
+                    "timestamp": _utcnow_iso(),
+                }
+                logger.info(f"Synced {touched} patterns to Neo4j")
+
+        except Exception as e:
+            logger.error(f"Neo4j sync failed: {e}")
+            results["status"] = "partial"
+            results["neo4j"] = {
+                "status": "error",
+                "error": str(e),
+                "timestamp": _utcnow_iso(),
+            }
+
+    return results
 
 
 @mcp.tool()
@@ -234,92 +259,74 @@ async def check_tos_health() -> Dict[str, Any]:
     Returns:
         Health metrics including latency, counts, and status
     """
-    health = {
+    health: Dict[str, Any] = {
         "status": "unknown",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": _utcnow_iso(),
         "qdrant": {"status": "unknown"},
-        "neo4j": {"status": "unknown"}
+        "neo4j": {"status": "unknown"},
     }
-    
-    # Check Qdrant
+
+    # Qdrant probe — light-weight: only count collections, skip per-collection
+    # walk (the old version made 119 sequential get_collection calls).
     try:
         qdrant_client = get_qdrant_client()
-        start = datetime.utcnow()
-        
+        t0 = time.perf_counter()
         collections = qdrant_client.get_collections()
-        latency = (datetime.utcnow() - start).total_seconds() * 1000
-        
-        # Get collection info
-        collection_info = {}
-        for col in collections.collections:
-            info = qdrant_client.get_collection(col.name)
-            collection_info[col.name] = {
-                "points": info.points_count,
-                "vectors": info.vectors_count if hasattr(info, 'vectors_count') else info.points_count
-            }
-        
+        latency_ms = (time.perf_counter() - t0) * 1000
+
         health["qdrant"] = {
             "status": "healthy",
-            "latency_ms": round(latency, 2),
-            "collections": len(collection_info),
-            "url": QDRANT_URL
+            "latency_ms": round(latency_ms, 2),
+            "collections": len(collections.collections),
+            "url": QDRANT_URL,
         }
     except Exception as e:
-        health["qdrant"] = {
-            "status": "error",
-            "error": str(e)
-        }
-    
-    # Check Neo4j
+        logger.error(f"Qdrant health check failed: {e}")
+        health["qdrant"] = {"status": "error", "error": str(e), "url": QDRANT_URL}
+
+    # Neo4j probe — UNWIND labels(n) so multi-label nodes count under each of
+    # their labels, plus an explicit unlabeled bucket.
     try:
-        start = datetime.utcnow()
-
+        t0 = time.perf_counter()
         async with neo4j_session() as session:
-            result = session.run("""
+            label_rows = await _run_cypher(session, """
                 MATCH (n)
-                RETURN labels(n)[0] as label, count(n) as node_count
+                WITH n, labels(n) AS lbls
+                UNWIND CASE WHEN size(lbls) = 0 THEN ['_unlabeled'] ELSE lbls END AS lbl
+                RETURN lbl AS label, count(*) AS node_count
             """)
-
-            latency = (datetime.utcnow() - start).total_seconds() * 1000
-
-            node_counts = {}
-            for record in result:
-                label = record["label"] or "unlabeled"
-                node_counts[label] = record["node_count"]
-
-            # Get relationship counts
-            rel_result = session.run("""
-                MATCH ()-[r]->()
-                RETURN count(r) as rel_count
+            rel_rows = await _run_cypher(session, """
+                MATCH ()-[r]->() RETURN count(r) AS rel_count
             """)
-            rel_count = rel_result.single()["rel_count"]
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        node_counts = {row["label"]: row["node_count"] for row in label_rows}
+        rel_count = rel_rows[0]["rel_count"] if rel_rows else 0
 
         health["neo4j"] = {
             "status": "healthy",
-            "latency_ms": round(latency, 2),
+            "latency_ms": round(latency_ms, 2),
             "nodes": node_counts,
             "relationships": rel_count,
             "uri": NEO4J_URI,
-            "connection_pool": "enabled"
+            "connection_pool": "enabled",
         }
-        logger.info(f"Neo4j health check passed - latency: {latency:.2f}ms")
+        logger.info("Neo4j health check passed - latency: %.2fms", latency_ms)
 
     except Exception as e:
         logger.error(f"Neo4j health check failed: {e}")
-        health["neo4j"] = {
-            "status": "error",
-            "error": str(e),
-            "uri": NEO4J_URI
-        }
-    
+        health["neo4j"] = {"status": "error", "error": str(e), "uri": NEO4J_URI}
+
     # Overall status
-    if health["qdrant"]["status"] == "healthy" and health["neo4j"]["status"] == "healthy":
+    qstat = health["qdrant"]["status"]
+    nstat = health["neo4j"]["status"]
+    if qstat == "healthy" and nstat == "healthy":
         health["status"] = "healthy"
-    elif health["qdrant"]["status"] == "error" and health["neo4j"]["status"] == "error":
+    elif qstat == "error" and nstat == "error":
         health["status"] = "error"
     else:
         health["status"] = "degraded"
-    
+
     return health
 
 

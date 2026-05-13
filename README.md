@@ -11,6 +11,7 @@ CRUD, and cross-document discovery — all through a single MCP server.
 **`check_tos_health`** — Monitor Qdrant and Neo4j connectivity, latency, node/collection counts.
 
 **`sync_to_tos`** — Batch-sync patterns to Qdrant and/or Neo4j.
+
 - `patterns`: List of `{text, source, category, importance}` dicts
 - `target`: "qdrant", "neo4j", or "both" (default: "both")
 - `collection`: Qdrant collection name
@@ -21,6 +22,7 @@ CRUD, and cross-document discovery — all through a single MCP server.
 Creates a Document node in Neo4j with MENTIONS/REFERENCES edges to Entity nodes,
 and upserts the embedded vector to Qdrant — all in one tool call. Handles both
 named vectors (e.g. `dense`) and unnamed default vectors automatically.
+
 - `text`: Document content for embedding
 - `collection`: Qdrant collection name
 - `title`: Document title
@@ -32,6 +34,7 @@ named vectors (e.g. `dense`) and unnamed default vectors automatically.
 **`search_with_graph`** — Graph-enhanced semantic search (GraphRAG).
 Embeds the query, searches Qdrant, then expands results via Neo4j shared-entity
 traversal. Documents connected through the knowledge graph get score boosts.
+
 - `query`, `collection`: Required
 - `limit`: Max results (default 10)
 - `relationship_boost`: Score boost for graph-connected docs (0.0–0.5, default 0.2)
@@ -40,6 +43,7 @@ traversal. Documents connected through the knowledge graph get score boosts.
 
 **`find_related_docs`** — Graph traversal from a known document.
 Finds documents connected to a source document through shared Neo4j entities.
+
 - `qdrant_id`: Source document's Qdrant UUID
 - `max_depth`: Traversal depth 1–3 (default 2)
 - `limit`: Max related docs (default 10)
@@ -51,14 +55,17 @@ Finds documents connected to a source document through shared Neo4j entities.
 **`create_or_update_entities`** — Create or update entities with observations.
 Uses MERGE for deduplication: existing entities get new observations appended
 (deduped), new entities are created. Replaces `neo4j-memory-remote:create_entities`
-+ `add_observations`.
-- `entities`: `[{name, type, observations: [...]}]`
-- `check_existing`: If true (default), MERGE; if false, always CREATE
-- Returns: created, updated, total counts
+
+- `add_observations`.
+
+* `entities`: `[{name, type, observations: [...]}]`
+* `check_existing`: If true (default), MERGE; if false, always CREATE
+* Returns: created, updated, total counts
 
 **`create_relationships`** — Create typed relationships between entities.
 Uses MERGE safety — auto-creates missing entities as `concept` type.
 Replaces `neo4j-memory-remote:create_relations`.
+
 - `relationships`: `[{from_entity, to_entity, rel_type, context}]`
 - Returns: created count
 
@@ -66,6 +73,7 @@ Replaces `neo4j-memory-remote:create_relations`.
 Returns entities with their observations, types, and which documents mention them.
 Use for deduplication before creating new entities. Replaces
 `neo4j-memory-remote:search_memories` + `find_memories_by_name`.
+
 - `query`: Search string
 - `entity_type`: Optional type filter
 - `limit`: Max results (default 20)
@@ -83,15 +91,15 @@ pip install -e .
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `QDRANT_URL` | Yes | `http://localhost:6333` | Qdrant server URL |
-| `QDRANT_API_KEY` | Yes | — | Qdrant API key |
-| `NEO4J_URI` | Yes | `bolt://localhost:7687` | Neo4j connection URI |
-| `NEO4J_USER` | No | `neo4j` | Neo4j username |
-| `NEO4J_PASSWORD` | Yes | — | Neo4j password |
-| `OLLAMA_URL` | No | `http://localhost:11434` | Ollama embedding server |
-| `OLLAMA_EMBED_MODEL` | No | `mxbai-embed-large` | Embedding model (1024 dims) |
+| Variable             | Required | Default                  | Description                 |
+| -------------------- | -------- | ------------------------ | --------------------------- |
+| `QDRANT_URL`         | Yes      | `http://localhost:6333`  | Qdrant server URL           |
+| `QDRANT_API_KEY`     | Yes      | —                        | Qdrant API key              |
+| `NEO4J_URI`          | Yes      | `bolt://localhost:7687`  | Neo4j connection URI        |
+| `NEO4J_USER`         | No       | `neo4j`                  | Neo4j username              |
+| `NEO4J_PASSWORD`     | Yes      | —                        | Neo4j password              |
+| `OLLAMA_URL`         | No       | `http://localhost:11434` | Ollama embedding server     |
+| `OLLAMA_EMBED_MODEL` | No       | `mxbai-embed-large`      | Embedding model (1024 dims) |
 
 ## Claude Desktop Configuration
 
@@ -147,6 +155,7 @@ plus any custom types created via `create_relationships`.
 ## What TOS-bridge Does NOT Replace
 
 These still require direct tool access:
+
 - **qdrant-new**: Collection admin, delete_documents, hybrid_search, index_codebase, search_code
 - **neo4j-mcp-remote**: Raw Cypher queries for complex multi-hop analysis
 - **neo4j-memory-remote**: delete_entities, delete_observations, delete_relations, read_graph
@@ -154,6 +163,7 @@ These still require direct tool access:
 ## Changelog
 
 ### v0.2.0 (2026-03-14)
+
 - **New tools**: `create_or_update_entities`, `create_relationships`, `find_entities`
 - **Fixed**: `graph_tools.py` now handles named vectors via `_get_collection_vector_name`
 - **Fixed**: `sync_to_tos` Qdrant path — was a placeholder, now embeds and upserts
@@ -163,6 +173,7 @@ These still require direct tool access:
   neo4j-memory-remote calls
 
 ### v0.1.0 (2026-02-04)
+
 - Initial release: health checks, pattern sync
 - Graph-enhanced search (store_doc_with_graph, search_with_graph, find_related_docs)
 - Circuit breakers for Qdrant, Neo4j, and Ollama
