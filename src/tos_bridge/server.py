@@ -32,8 +32,20 @@ from .graph_tools import (
     neo4j_session,
     _run_cypher,
     _utcnow_iso,
+    # Phase 3 additions
+    ensure_constraints,
+    run_cypher_tool,
+    get_entities_tool,
+    delete_entities_tool,
+    delete_observations_tool,
+    delete_relationships_tool,
+    manage_collections_tool,
+    create_payload_index_tool,
+    delete_point_tool,
+    update_payload_tool,
+    hybrid_search_tool,
 )
-from .embedding import get_embedding, warmup_ollama
+from .embedding import get_embedding, warmup_ollama, embed_cache_stats
 
 
 def _pattern_key(text: str, source: str) -> str:
@@ -506,6 +518,195 @@ async def find_entities(
         entity_type=entity_type,
         limit=limit
     )
+
+
+# ============================================================================
+# Phase 3 tools — full coverage so the dedicated neo4j-mcp-remote and
+# qdrant-new MCP servers can be retired.
+# ============================================================================
+
+
+@mcp.tool()
+async def run_cypher(
+    query: str,
+    params: Optional[Dict[str, Any]] = None,
+    read_only: bool = True,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Execute arbitrary Cypher against the project's Neo4j.
+
+    Defaults to read-only mode — write keywords (CREATE/MERGE/DELETE/SET/
+    REMOVE/DROP/FOREACH/LOAD) are rejected unless `read_only=False` is set
+    explicitly. Always use $param placeholders; never string-interpolate
+    user input.
+
+    Args:
+        query: Cypher statement.
+        params: Parameter map for $name placeholders.
+        read_only: Reject write keywords if True (default).
+        limit: Max rows returned (server-side cap, default 100).
+
+    Returns:
+        {rows, row_count, truncated, classification}
+    """
+    return await run_cypher_tool(query=query, params=params, read_only=read_only, limit=limit)
+
+
+@mcp.tool()
+async def get_entities(
+    names: List[str],
+    include_documents: bool = True,
+) -> Dict[str, Any]:
+    """Fetch entities by exact name (case-sensitive). Faster than search_entities
+    when you already know which entities you want. Returns both found and missing
+    names so you can detect deletions or typos.
+    """
+    return await get_entities_tool(names=names, include_documents=include_documents)
+
+
+@mcp.tool()
+async def delete_entities(
+    names: List[str],
+    detach: bool = True,
+) -> Dict[str, Any]:
+    """Delete entities by name.
+
+    DETACH DELETE is the default: connected relationships are deleted too.
+    Pass `detach=False` to fail-loud when relationships exist.
+    """
+    return await delete_entities_tool(names=names, detach=detach)
+
+
+@mcp.tool()
+async def delete_observations(
+    name: str,
+    observations: List[str],
+) -> Dict[str, Any]:
+    """Remove specific observation strings from an entity, preserving the rest.
+
+    Idempotent: missing observations are no-ops. Use to retract a specific
+    fact without losing everything else known about the entity.
+    """
+    return await delete_observations_tool(name=name, observations=observations)
+
+
+@mcp.tool()
+async def delete_relationships(
+    from_entity: str,
+    to_entity: str,
+    rel_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Delete relationships between two entities.
+
+    With no rel_type, deletes ALL relationships in the from→to direction.
+    With a rel_type, only deletes that specific type. rel_type is whitelisted
+    against ^[A-Z_][A-Z0-9_]+$ to block Cypher injection.
+    """
+    return await delete_relationships_tool(
+        from_entity=from_entity, to_entity=to_entity, rel_type=rel_type
+    )
+
+
+@mcp.tool()
+async def manage_collections(
+    action: str,
+    name: Optional[str] = None,
+    vector_size: int = 1024,
+    distance: str = "Cosine",
+    on_disk: bool = False,
+) -> Dict[str, Any]:
+    """Manage Qdrant collections.
+
+    Args:
+        action: list | info | create | delete | recreate
+        name: Collection name (required except for 'list').
+        vector_size: For create/recreate. Default 1024 matches mxbai-embed-large.
+        distance: One of Cosine, Euclid, Dot, Manhattan.
+        on_disk: Store vectors on disk for large collections.
+    """
+    return await manage_collections_tool(
+        action=action, name=name, vector_size=vector_size, distance=distance, on_disk=on_disk
+    )
+
+
+@mcp.tool()
+async def create_payload_index(
+    collection: str,
+    field: str,
+    field_schema: str = "keyword",
+) -> Dict[str, Any]:
+    """Create a Qdrant payload index on a collection field.
+
+    Required for filtered queries to be fast. `field_schema` is one of:
+    keyword, integer, float, bool, geo, text, datetime, uuid.
+    """
+    return await create_payload_index_tool(
+        collection=collection, field=field, field_schema=field_schema
+    )
+
+
+@mcp.tool()
+async def delete_point(
+    collection: str,
+    point_id: str,
+) -> Dict[str, Any]:
+    """Delete a single point from a Qdrant collection by id."""
+    return await delete_point_tool(collection=collection, point_id=point_id)
+
+
+@mcp.tool()
+async def update_payload(
+    collection: str,
+    point_id: str,
+    payload: Dict[str, Any],
+    replace: bool = False,
+) -> Dict[str, Any]:
+    """Update or replace the payload of a Qdrant point.
+
+    `replace=False` (default) merges into the existing payload; True overwrites
+    the entire payload with `payload`.
+    """
+    return await update_payload_tool(
+        collection=collection, point_id=point_id, payload=payload, replace=replace
+    )
+
+
+@mcp.tool()
+async def hybrid_search(
+    query: str,
+    collection: str,
+    limit: int = 10,
+    title_filter: Optional[str] = None,
+    payload_filter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dense semantic search with optional payload filtering.
+
+    Practical alternative to BM25+vector hybrid (which requires sparse-vector
+    collection config). Accepts a title substring filter and a payload-equality
+    map applied server-side by Qdrant. For a pure vector query, omit both
+    filter arguments.
+    """
+    return await hybrid_search_tool(
+        query=query,
+        collection=collection,
+        limit=limit,
+        title_filter=title_filter,
+        payload_filter=payload_filter,
+    )
+
+
+@mcp.tool()
+async def embed_cache_status() -> Dict[str, Any]:
+    """Return embedding-cache statistics (size, hits, misses, hit rate).
+
+    Useful for tuning OLLAMA_EMBED_CACHE_SIZE and confirming the cache is
+    actually being hit on repeat queries.
+    """
+    return {
+        "status": "success",
+        "cache": embed_cache_stats(),
+        "timestamp": _utcnow_iso(),
+    }
 
 
 if __name__ == "__main__":

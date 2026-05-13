@@ -83,6 +83,38 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def ensure_constraints() -> Dict[str, Any]:
+    """Create idempotent uniqueness constraints needed for safe concurrent MERGE.
+
+    Without these, concurrent MERGE on (:Entity {name}) can produce duplicates
+    under racing tool calls. Running at startup is safe — Neo4j skips existing
+    constraints.
+
+    Returns a dict of constraint creation results for logging.
+    """
+    results: Dict[str, Any] = {}
+    statements = {
+        "entity_name_unique": "CREATE CONSTRAINT entity_name_unique IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE",
+        "document_qdrant_id_unique": "CREATE CONSTRAINT document_qdrant_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.qdrant_id IS UNIQUE",
+        "pattern_hash_unique": "CREATE CONSTRAINT pattern_hash_unique IF NOT EXISTS FOR (p:Pattern) REQUIRE p.hash IS UNIQUE",
+    }
+    try:
+        async with neo4j_session() as session:
+            for name, stmt in statements.items():
+                try:
+                    await _run_cypher(session, stmt)
+                    results[name] = "ok"
+                except Exception as e:
+                    # Most likely cause: existing duplicate rows blocking the constraint.
+                    # We log and continue — the constraint that does land still helps.
+                    results[name] = f"skipped: {e}"
+                    logger.warning("Could not create constraint %s: %s", name, e)
+    except Exception as e:
+        logger.warning("ensure_constraints could not connect to Neo4j: %s", e)
+        results["_connect"] = f"error: {e}"
+    return results
+
+
 async def _run_cypher(session, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Run a Cypher query in a worker thread to avoid blocking the asyncio loop.
 
@@ -846,5 +878,516 @@ async def search_entities(
         "query": query,
         "results": entities,
         "total": len(entities),
+        "timestamp": _utcnow_iso(),
+    }
+
+
+# ============================================================================
+# Phase 3 tools — coverage parity with neo4j-mcp-remote + qdrant-new
+# ============================================================================
+
+# Whitelist of statement-opening keywords considered read-only. Comments and
+# leading whitespace are stripped before the check.
+_READ_ONLY_PREFIXES = ("MATCH", "RETURN", "WITH", "CALL", "SHOW", "USE", "EXPLAIN", "PROFILE", "UNWIND")
+_WRITE_KEYWORDS = ("CREATE", "MERGE", "DELETE", "DETACH", "SET", "REMOVE", "DROP", "FOREACH", "LOAD")
+
+
+def _strip_cypher_comments(query: str) -> str:
+    """Strip Cypher line comments (//) and block comments (/* */)."""
+    # Block comments
+    out, i, n = [], 0, len(query)
+    while i < n:
+        if query[i:i+2] == "/*":
+            end = query.find("*/", i + 2)
+            i = (end + 2) if end != -1 else n
+        elif query[i:i+2] == "//":
+            end = query.find("\n", i + 2)
+            i = end if end != -1 else n
+        else:
+            out.append(query[i])
+            i += 1
+    return "".join(out)
+
+
+def _classify_cypher(query: str) -> str:
+    """Return 'read' or 'write' based on the first significant keyword.
+
+    Conservative: anything containing a write keyword as a top-level statement
+    is classified write, even if the first token is MATCH (e.g. MATCH...DELETE).
+    """
+    cleaned = _strip_cypher_comments(query).strip().upper()
+    if not cleaned:
+        raise ValueError("empty query")
+    # Tokenize by whitespace and punctuation enough for top-level keyword scan
+    tokens = re.findall(r"[A-Z]+", cleaned)
+    if not tokens:
+        raise ValueError("no keywords in query")
+    # First token must be read-only-friendly
+    if tokens[0] not in _READ_ONLY_PREFIXES:
+        return "write"
+    # Any write keyword anywhere outside of strings is conservative-write.
+    for tok in tokens:
+        if tok in _WRITE_KEYWORDS:
+            return "write"
+    return "read"
+
+
+async def run_cypher_tool(
+    query: str,
+    params: Optional[Dict[str, Any]] = None,
+    read_only: bool = True,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Execute an arbitrary Cypher query against the project's Neo4j.
+
+    Args:
+        query: Cypher text. Comments stripped before classification.
+        params: Parameter map (use $name placeholders in the query — DO NOT
+            string-interpolate user input).
+        read_only: If True (default), reject any statement that contains
+            CREATE/MERGE/DELETE/SET/REMOVE/DROP/FOREACH/LOAD. Set False for
+            destructive admin queries (be careful).
+        limit: Maximum rows returned to the caller. Server-side limit is
+            applied for safety even if the query returns more.
+
+    Returns:
+        Dict with rows (truncated to `limit`) and a `truncated` flag if more
+        rows existed.
+    """
+    classification = _classify_cypher(query)
+    if read_only and classification != "read":
+        raise ValueError(
+            "Query classified as 'write' but read_only=True. "
+            "Set read_only=False explicitly if you intend to modify data."
+        )
+
+    async with neo4j_session() as session:
+        rows = await _run_cypher(session, query, params or {})
+
+    truncated = len(rows) > limit
+    return {
+        "status": "success",
+        "classification": classification,
+        "rows": rows[:limit],
+        "row_count": len(rows[:limit]),
+        "truncated": truncated,
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def get_entities_tool(
+    names: List[str],
+    include_documents: bool = True,
+) -> Dict[str, Any]:
+    """Fetch entities by exact name (case-sensitive match on Entity.name).
+
+    Faster and more precise than search_entities for known IDs.
+    """
+    if not names:
+        return {"status": "success", "results": [], "total": 0, "timestamp": _utcnow_iso()}
+
+    cypher = """
+        UNWIND $names AS n
+        OPTIONAL MATCH (e:Entity {name: n})
+        OPTIONAL MATCH (e)<-[:MENTIONS|REFERENCES]-(d:Document)
+        WITH n, e, collect(DISTINCT d.title) AS mentioned_in
+        RETURN n AS requested_name,
+               e.name AS name,
+               e.type AS type,
+               e.observations AS observations,
+               e.created_at AS created_at,
+               e.updated_at AS updated_at,
+               CASE WHEN $include_docs THEN mentioned_in ELSE [] END AS mentioned_in_documents
+    """
+    async with neo4j_session() as session:
+        rows = await _run_cypher(session, cypher, {"names": names, "include_docs": include_documents})
+
+    found = []
+    missing = []
+    for row in rows:
+        if row.get("name") is None:
+            missing.append(row["requested_name"])
+        else:
+            found.append({
+                "name": row["name"],
+                "type": row["type"],
+                "observations": row["observations"] or [],
+                "created_at": str(row["created_at"]) if row["created_at"] else None,
+                "updated_at": str(row["updated_at"]) if row["updated_at"] else None,
+                "mentioned_in_documents": row["mentioned_in_documents"] or [],
+            })
+    return {
+        "status": "success",
+        "results": found,
+        "missing": missing,
+        "total": len(found),
+        "requested": len(names),
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def delete_entities_tool(
+    names: List[str],
+    detach: bool = True,
+) -> Dict[str, Any]:
+    """Delete one or more entities by name.
+
+    Args:
+        names: List of entity names to delete.
+        detach: If True (default), also delete connected relationships.
+            If False, the delete will fail if the entity has any relationships.
+    """
+    if not names:
+        return {"status": "success", "deleted": 0, "timestamp": _utcnow_iso()}
+
+    cypher = """
+        UNWIND $names AS n
+        MATCH (e:Entity {name: n})
+    """
+    if detach:
+        cypher += "DETACH DELETE e\n"
+    else:
+        cypher += "DELETE e\n"
+    cypher += "RETURN count(e) AS deleted"
+
+    async with neo4j_session() as session:
+        rows = await _run_cypher(session, cypher, {"names": names})
+    deleted = rows[0]["deleted"] if rows else 0
+    return {
+        "status": "success",
+        "deleted": deleted,
+        "requested": len(names),
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def delete_observations_tool(
+    name: str,
+    observations: List[str],
+) -> Dict[str, Any]:
+    """Remove specific observation strings from an entity (others retained).
+
+    No-op for observations not currently present. Returns the new count.
+    """
+    if not name:
+        raise ValueError("name is required")
+    cypher = """
+        MATCH (e:Entity {name: $name})
+        SET e.observations = [o IN e.observations WHERE NOT o IN $to_remove],
+            e.updated_at = datetime()
+        RETURN size(e.observations) AS remaining
+    """
+    async with neo4j_session() as session:
+        rows = await _run_cypher(session, cypher, {"name": name, "to_remove": observations})
+    if not rows:
+        raise ValueError(f"Entity not found: {name}")
+    return {
+        "status": "success",
+        "name": name,
+        "remaining_observations": rows[0]["remaining"],
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def delete_relationships_tool(
+    from_entity: str,
+    to_entity: str,
+    rel_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Delete relationships between two entities.
+
+    Args:
+        from_entity: Source entity name.
+        to_entity: Target entity name.
+        rel_type: If supplied, only delete relationships of this type;
+            otherwise delete all relationships between the two entities.
+    """
+    if rel_type:
+        rt = _validate_rel_type(rel_type, default="")
+        if not rt:
+            raise ValueError(f"Invalid rel_type: {rel_type}")
+        cypher = f"""
+            MATCH (a:Entity {{name: $from_name}})-[r:{rt}]->(b:Entity {{name: $to_name}})
+            DELETE r
+            RETURN count(r) AS deleted
+        """
+    else:
+        cypher = """
+            MATCH (a:Entity {name: $from_name})-[r]->(b:Entity {name: $to_name})
+            DELETE r
+            RETURN count(r) AS deleted
+        """
+    async with neo4j_session() as session:
+        rows = await _run_cypher(session, cypher, {"from_name": from_entity, "to_name": to_entity})
+    return {
+        "status": "success",
+        "deleted": rows[0]["deleted"] if rows else 0,
+        "from_entity": from_entity,
+        "to_entity": to_entity,
+        "rel_type": rel_type,
+        "timestamp": _utcnow_iso(),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Qdrant admin tools
+# ----------------------------------------------------------------------------
+
+# Distance metric whitelist (mirrors qdrant_client.models.Distance enum)
+_DISTANCE_MAP = {
+    "Cosine": "Cosine",
+    "Euclid": "Euclid",
+    "Dot": "Dot",
+    "Manhattan": "Manhattan",
+}
+
+
+async def manage_collections_tool(
+    action: str,
+    name: Optional[str] = None,
+    vector_size: int = 1024,
+    distance: str = "Cosine",
+    on_disk: bool = False,
+) -> Dict[str, Any]:
+    """Manage Qdrant collections: list, info, create, delete, recreate.
+
+    Args:
+        action: One of "list", "info", "create", "delete", "recreate".
+        name: Collection name (required for info/create/delete/recreate).
+        vector_size: Vector dimension (for create/recreate). Default 1024
+            matches mxbai-embed-large.
+        distance: Distance metric — Cosine, Euclid, Dot, or Manhattan.
+        on_disk: Store vectors on disk instead of RAM (for large collections).
+    """
+    from qdrant_client.models import Distance, VectorParams
+
+    client = get_qdrant_client()
+    action = action.lower().strip()
+
+    if action == "list":
+        cols = client.get_collections().collections
+        return {
+            "status": "success",
+            "action": "list",
+            "collections": [c.name for c in cols],
+            "count": len(cols),
+            "timestamp": _utcnow_iso(),
+        }
+
+    if not name:
+        raise ValueError(f"action={action!r} requires 'name'")
+
+    if action == "info":
+        info = client.get_collection(name)
+        config = info.config.params
+        # The dict form (named vectors) vs object form is awkward to introspect;
+        # report what's available.
+        vectors = config.vectors
+        if isinstance(vectors, dict):
+            vec_summary = {k: {"size": v.size, "distance": str(v.distance)} for k, v in vectors.items()}
+        else:
+            vec_summary = {"_default": {"size": vectors.size, "distance": str(vectors.distance)}}
+        return {
+            "status": "success",
+            "action": "info",
+            "name": name,
+            "points_count": info.points_count,
+            "vectors": vec_summary,
+            "status_field": str(info.status),
+            "timestamp": _utcnow_iso(),
+        }
+
+    if action in ("create", "recreate"):
+        if distance not in _DISTANCE_MAP:
+            raise ValueError(f"Unsupported distance {distance!r}; must be one of {list(_DISTANCE_MAP)}")
+        dist_enum = getattr(Distance, distance.upper())
+        params = VectorParams(size=vector_size, distance=dist_enum, on_disk=on_disk)
+        if action == "recreate":
+            try:
+                client.delete_collection(collection_name=name)
+            except Exception:
+                pass  # ok if it didn't exist
+        client.create_collection(collection_name=name, vectors_config=params)
+        return {
+            "status": "success",
+            "action": action,
+            "name": name,
+            "vector_size": vector_size,
+            "distance": distance,
+            "on_disk": on_disk,
+            "timestamp": _utcnow_iso(),
+        }
+
+    if action == "delete":
+        client.delete_collection(collection_name=name)
+        return {
+            "status": "success",
+            "action": "delete",
+            "name": name,
+            "timestamp": _utcnow_iso(),
+        }
+
+    raise ValueError(f"Unknown action {action!r}; must be list|info|create|delete|recreate")
+
+
+async def create_payload_index_tool(
+    collection: str,
+    field: str,
+    field_schema: str = "keyword",
+) -> Dict[str, Any]:
+    """Create a payload index on a Qdrant collection field.
+
+    Payload indexes are required for filtered queries to be fast.
+
+    Args:
+        collection: Collection name.
+        field: Payload field path (e.g. "category", "source", "tags").
+        field_schema: One of "keyword", "integer", "float", "bool",
+            "geo", "text", "datetime", "uuid".
+    """
+    from qdrant_client.models import PayloadSchemaType
+
+    schema_map = {
+        "keyword": PayloadSchemaType.KEYWORD,
+        "integer": PayloadSchemaType.INTEGER,
+        "float": PayloadSchemaType.FLOAT,
+        "bool": PayloadSchemaType.BOOL,
+        "geo": PayloadSchemaType.GEO,
+        "text": PayloadSchemaType.TEXT,
+        "datetime": PayloadSchemaType.DATETIME,
+        "uuid": PayloadSchemaType.UUID,
+    }
+    schema = schema_map.get(field_schema.lower())
+    if schema is None:
+        raise ValueError(f"Unsupported field_schema {field_schema!r}")
+
+    client = get_qdrant_client()
+    client.create_payload_index(
+        collection_name=collection,
+        field_name=field,
+        field_schema=schema,
+    )
+    return {
+        "status": "success",
+        "collection": collection,
+        "field": field,
+        "field_schema": field_schema,
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def delete_point_tool(
+    collection: str,
+    point_id: str,
+) -> Dict[str, Any]:
+    """Delete a single point from a Qdrant collection by id."""
+    client = get_qdrant_client()
+    client.delete(collection_name=collection, points_selector=[point_id])
+    return {
+        "status": "success",
+        "collection": collection,
+        "point_id": point_id,
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def update_payload_tool(
+    collection: str,
+    point_id: str,
+    payload: Dict[str, Any],
+    replace: bool = False,
+) -> Dict[str, Any]:
+    """Update or replace the payload of a Qdrant point.
+
+    Args:
+        collection: Collection name.
+        point_id: Target point id.
+        payload: Fields to set on the point.
+        replace: If True, replace the whole payload; if False (default),
+            merge into existing payload.
+    """
+    client = get_qdrant_client()
+    if replace:
+        client.overwrite_payload(collection_name=collection, points=[point_id], payload=payload)
+    else:
+        client.set_payload(collection_name=collection, points=[point_id], payload=payload)
+    return {
+        "status": "success",
+        "collection": collection,
+        "point_id": point_id,
+        "mode": "replace" if replace else "merge",
+        "fields_set": list(payload.keys()),
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def hybrid_search_tool(
+    query: str,
+    collection: str,
+    limit: int = 10,
+    title_filter: Optional[str] = None,
+    payload_filter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dense semantic search with optional payload filtering.
+
+    True BM25+vector hybrid search requires a collection configured with sparse
+    vectors (Qdrant 1.10+ Prefetch). Most existing collections aren't, so this
+    tool implements a practical alternative: dense vector search with optional
+    title substring and payload-equality filters applied server-side.
+
+    Args:
+        query: Query text (will be embedded).
+        collection: Qdrant collection name.
+        limit: Max results.
+        title_filter: If set, only return points whose payload.title contains
+            this substring (case-insensitive).
+        payload_filter: Optional dict of payload fields → required values.
+            Each key becomes a Qdrant MatchValue filter.
+
+    Returns:
+        Dict with results.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText
+
+    query_embedding = await get_embedding(query)
+    client = get_qdrant_client()
+    vector_name = _get_collection_vector_name(client, collection)
+
+    must_conditions: List[FieldCondition] = []
+    if title_filter:
+        must_conditions.append(FieldCondition(key="title", match=MatchText(text=title_filter)))
+    if payload_filter:
+        for k, v in payload_filter.items():
+            must_conditions.append(FieldCondition(key=k, match=MatchValue(value=v)))
+
+    qfilter = Filter(must=must_conditions) if must_conditions else None
+
+    kwargs: Dict[str, Any] = {
+        "collection_name": collection,
+        "query": query_embedding,
+        "limit": limit,
+        "with_payload": True,
+    }
+    if vector_name:
+        kwargs["using"] = vector_name
+    if qfilter:
+        kwargs["query_filter"] = qfilter
+
+    hits = client.query_points(**kwargs).points
+    return {
+        "status": "success",
+        "collection": collection,
+        "results": [
+            {
+                "id": str(h.id),
+                "score": round(h.score, 4),
+                "title": (h.payload or {}).get("title", ""),
+                "summary": (h.payload or {}).get("summary", ""),
+                "payload": h.payload,
+            }
+            for h in hits
+        ],
+        "total": len(hits),
+        "filtered": bool(must_conditions),
         "timestamp": _utcnow_iso(),
     }
