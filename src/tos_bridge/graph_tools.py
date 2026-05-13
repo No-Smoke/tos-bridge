@@ -99,9 +99,19 @@ async def _run_cypher(session, query: str, params: Optional[Dict[str, Any]] = No
     return await asyncio.to_thread(_work)
 
 
+# Cached Qdrant client. Reconstructing on every tool call costs ~50-200ms in
+# TLS+TCP setup that's pure overhead on a long-lived MCP server. Holding one
+# QdrantClient for the process lifetime is safe — the underlying httpx client
+# is thread-safe for concurrent requests.
+_qdrant_client: Optional[QdrantClient] = None
+
+
 def get_qdrant_client() -> QdrantClient:
-    """Initialize Qdrant client with API key."""
-    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    """Return a module-cached Qdrant client (constructed lazily on first call)."""
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    return _qdrant_client
 
 
 def _get_collection_vector_name(qdrant_client: QdrantClient, collection: str) -> Optional[str]:
@@ -149,8 +159,9 @@ async def get_neo4j_driver_with_retry(max_retries: int = 3):
                 _neo4j_driver = GraphDatabase.driver(
                     NEO4J_URI,
                     auth=(NEO4J_USER, NEO4J_PASSWORD),
-                    max_connection_lifetime=300,  # 5 minutes
-                    max_connection_pool_size=10,  # raised in Phase 2
+                    max_connection_lifetime=300,    # 5 minutes
+                    max_connection_pool_size=50,    # raised from 10 — was bottlenecking concurrent MCP calls under remote latency
+                    connection_acquisition_timeout=30,  # explicit, was implicit
                     connection_timeout=20,
                 )
 
@@ -634,62 +645,67 @@ async def manage_entities(
     Returns:
         Dict with created, updated, and total counts
     """
-    created = 0
-    updated = 0
+    # Normalise + filter once in Python (cheap), then ship the whole batch to
+    # Neo4j in a single Cypher round-trip via UNWIND.
+    normalised = [
+        {
+            "name": e.get("name"),
+            "type": e.get("type", "concept"),
+            "observations": e.get("observations", []) or [],
+        }
+        for e in entities
+        if e.get("name")
+    ]
+
+    if not normalised:
+        return {
+            "status": "success",
+            "created": 0,
+            "updated": 0,
+            "total": 0,
+            "timestamp": _utcnow_iso(),
+        }
 
     async with neo4j_session() as session:
-        for entity in entities:
-            name = entity.get("name")
-            if not name:
-                continue
-            entity_type = entity.get("type", "concept")
-            observations = entity.get("observations", [])
+        if check_existing:
+            # Single round-trip MERGE for the whole batch. The OPTIONAL MATCH
+            # captures pre-existence BEFORE MERGE fires, so we can count
+            # created vs updated accurately even when timestamps collide.
+            rows = await _run_cypher(session, """
+                UNWIND $entities AS ent
+                OPTIONAL MATCH (existing:Entity {name: ent.name})
+                WITH ent, existing IS NOT NULL AS was_existing
+                MERGE (e:Entity {name: ent.name})
+                ON CREATE SET
+                    e.type = ent.type,
+                    e.observations = ent.observations,
+                    e.created_at = datetime(),
+                    e.updated_at = datetime()
+                ON MATCH SET
+                    e.type = CASE WHEN e.type = 'concept' THEN ent.type ELSE e.type END,
+                    e.observations = e.observations + [obs IN ent.observations WHERE NOT obs IN e.observations],
+                    e.updated_at = datetime()
+                RETURN
+                    sum(CASE WHEN was_existing THEN 0 ELSE 1 END) AS created,
+                    sum(CASE WHEN was_existing THEN 1 ELSE 0 END) AS updated
+            """, {"entities": normalised})
 
-            if check_existing:
-                # Detect create-vs-update by capturing whether the node already
-                # existed BEFORE the SET clauses fire. CASE-on-equal-timestamps
-                # is unreliable when ON CREATE and ON MATCH both run datetime()
-                # in the same millisecond.
-                rows = await _run_cypher(session, """
-                    OPTIONAL MATCH (existing:Entity {name: $name})
-                    WITH existing IS NOT NULL AS was_existing, $name AS name_param
-                    MERGE (e:Entity {name: name_param})
-                    ON CREATE SET
-                        e.type = $type,
-                        e.observations = $observations,
-                        e.created_at = datetime(),
-                        e.updated_at = datetime()
-                    ON MATCH SET
-                        e.type = CASE WHEN e.type = 'concept' THEN $type ELSE e.type END,
-                        e.observations = e.observations + [obs IN $observations WHERE NOT obs IN e.observations],
-                        e.updated_at = datetime()
-                    RETURN was_existing
-                """, {
-                    "name": name,
-                    "type": entity_type,
-                    "observations": observations,
+            row = rows[0] if rows else {"created": 0, "updated": 0}
+            created = row["created"] or 0
+            updated = row["updated"] or 0
+        else:
+            await _run_cypher(session, """
+                UNWIND $entities AS ent
+                CREATE (e:Entity {
+                    name: ent.name,
+                    type: ent.type,
+                    observations: ent.observations,
+                    created_at: datetime(),
+                    updated_at: datetime()
                 })
-                if not rows:
-                    raise RuntimeError(f"Neo4j MERGE failed for entity {name!r}")
-                if rows[0]["was_existing"]:
-                    updated += 1
-                else:
-                    created += 1
-            else:
-                await _run_cypher(session, """
-                    CREATE (e:Entity {
-                        name: $name,
-                        type: $type,
-                        observations: $observations,
-                        created_at: datetime(),
-                        updated_at: datetime()
-                    })
-                """, {
-                    "name": name,
-                    "type": entity_type,
-                    "observations": observations,
-                })
-                created += 1
+            """, {"entities": normalised})
+            created = len(normalised)
+            updated = 0
 
     return {
         "status": "success",
@@ -722,38 +738,44 @@ async def manage_relationships(
     Returns:
         Dict with created count
     """
+    # Group relationships by validated rel_type so we can UNWIND each group
+    # in a single Cypher call. Cypher does not allow parameterised relationship
+    # types, so the type must be interpolated — hence one query per distinct
+    # type, but only one round-trip per type regardless of group size.
+    from collections import defaultdict
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for rel in relationships:
+        from_name = rel.get("from_entity")
+        to_name = rel.get("to_entity")
+        if not from_name or not to_name:
+            continue
+        rel_type = _validate_rel_type(rel.get("rel_type", "RELATES_TO"), default="RELATES_TO")
+        grouped[rel_type].append({
+            "from_name": from_name,
+            "to_name": to_name,
+            "context": rel.get("context", ""),
+        })
+
     created = 0
-
     async with neo4j_session() as session:
-        for rel in relationships:
-            from_name = rel.get("from_entity")
-            to_name = rel.get("to_entity")
-            if not from_name or not to_name:
-                continue
-            # Whitelist the rel type before interpolating into Cypher
-            rel_type = _validate_rel_type(rel.get("rel_type", "RELATES_TO"), default="RELATES_TO")
-            context = rel.get("context", "")
-
+        for rel_type, rows in grouped.items():
             await _run_cypher(session, f"""
-                MERGE (a:Entity {{name: $from_name}})
+                UNWIND $rels AS rel
+                MERGE (a:Entity {{name: rel.from_name}})
                 ON CREATE SET a.type = 'concept',
                               a.observations = [],
                               a.created_at = datetime(),
                               a.updated_at = datetime()
-                MERGE (b:Entity {{name: $to_name}})
+                MERGE (b:Entity {{name: rel.to_name}})
                 ON CREATE SET b.type = 'concept',
                               b.observations = [],
                               b.created_at = datetime(),
                               b.updated_at = datetime()
                 MERGE (a)-[r:{rel_type}]->(b)
-                SET r.context = $context,
+                SET r.context = rel.context,
                     r.updated_at = datetime()
-            """, {
-                "from_name": from_name,
-                "to_name": to_name,
-                "context": context,
-            })
-            created += 1
+            """, {"rels": rows})
+            created += len(rows)
 
     return {
         "status": "success",
