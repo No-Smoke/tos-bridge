@@ -44,6 +44,24 @@ def get_qdrant_client() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
+def _get_collection_vector_name(qdrant_client: QdrantClient, collection: str) -> Optional[str]:
+    """
+    Detect whether a collection uses named vectors or an unnamed default vector.
+    Returns the vector name (e.g. 'dense') for named vectors, or None for unnamed.
+    """
+    try:
+        info = qdrant_client.get_collection(collection)
+        vectors_config = info.config.params.vectors
+        if isinstance(vectors_config, dict):
+            # Named vectors — return first vector name (typically 'dense')
+            return next(iter(vectors_config))
+        else:
+            # Unnamed default vector (VectorParams object)
+            return None
+    except Exception:
+        return None
+
+
 async def get_neo4j_driver_with_retry(max_retries: int = 3):
     """Get Neo4j driver with exponential backoff retry."""
     global _neo4j_driver, _last_health_check
@@ -167,12 +185,19 @@ async def store_document_with_graph(
         
         # 3. Store in Qdrant
         qdrant_client = get_qdrant_client()
+        vector_name = _get_collection_vector_name(qdrant_client, collection)
+        
+        if vector_name:
+            point_vector = {vector_name: embedding}
+        else:
+            point_vector = embedding
+        
         qdrant_client.upsert(
             collection_name=collection,
             points=[
                 PointStruct(
                     id=qdrant_id,
-                    vector=embedding,
+                    vector=point_vector,
                     payload=qdrant_metadata
                 )
             ]
@@ -185,6 +210,7 @@ async def store_document_with_graph(
             # Create Document node
             doc_result = session.run("""
                 CREATE (d:Document {
+                    name: $title,
                     qdrant_id: $qdrant_id,
                     qdrant_collection: $collection,
                     title: $title,
@@ -206,17 +232,22 @@ async def store_document_with_graph(
             # Create entities and MENTIONS relationships
             entities_created = 0
             for entity in (entities or []):
+                entity_name = entity.get("name")
+                entity_type = entity.get("type", "concept")
                 session.run("""
                     MATCH (d:Document {qdrant_id: $qdrant_id})
                     MERGE (e:Entity {name: $entity_name})
-                    ON CREATE SET e.type = $entity_type, e.created_at = datetime()
+                    ON CREATE SET e.type = $entity_type,
+                                  e.observations = [$initial_obs],
+                                  e.created_at = datetime()
                     MERGE (d)-[r:MENTIONS]->(e)
                     SET r.importance = $importance, r.created_at = datetime()
                 """, {
                     "qdrant_id": qdrant_id,
-                    "entity_name": entity.get("name"),
-                    "entity_type": entity.get("type", "concept"),
-                    "importance": entity.get("importance", 0.5)
+                    "entity_name": entity_name,
+                    "entity_type": entity_type,
+                    "importance": entity.get("importance", 0.5),
+                    "initial_obs": f"Referenced in document: {title}"
                 })
                 entities_created += 1
 
@@ -227,13 +258,16 @@ async def store_document_with_graph(
                 session.run(f"""
                     MATCH (d:Document {{qdrant_id: $qdrant_id}})
                     MERGE (t:Entity {{name: $target}})
-                    ON CREATE SET t.created_at = datetime()
+                    ON CREATE SET t.type = 'concept',
+                                  t.observations = [$initial_obs],
+                                  t.created_at = datetime()
                     MERGE (d)-[r:{rel_type}]->(t)
                     SET r.context = $context, r.created_at = datetime()
                 """, {
                     "qdrant_id": qdrant_id,
                     "target": rel.get("target"),
-                    "context": rel.get("context")
+                    "context": rel.get("context"),
+                    "initial_obs": f"Created via relationship from document: {title}"
                 })
                 rels_created += 1
         
@@ -293,12 +327,18 @@ async def graph_enhanced_search(
         
         # 2. Search Qdrant - get 2x limit for reranking headroom
         qdrant_client = get_qdrant_client()
-        search_results = qdrant_client.query_points(
-            collection_name=collection,
-            query=query_embedding,
-            limit=limit * 2,
-            with_payload=True
-        ).points
+        vector_name = _get_collection_vector_name(qdrant_client, collection)
+        
+        search_kwargs = {
+            "collection_name": collection,
+            "query": query_embedding,
+            "limit": limit * 2,
+            "with_payload": True,
+        }
+        if vector_name:
+            search_kwargs["using"] = vector_name
+        
+        search_results = qdrant_client.query_points(**search_kwargs).points
         
         if not search_results:
             return {"status": "success", "results": [], "total": 0}
@@ -521,6 +561,242 @@ async def find_related_documents(
             "timestamp": datetime.utcnow().isoformat()
         }
         
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+
+# ============================================================================
+# Tool 4: manage_entities (create/update entities with observations)
+# ============================================================================
+
+async def manage_entities(
+    entities: List[Dict[str, Any]],
+    check_existing: bool = True
+) -> Dict[str, Any]:
+    """
+    Create or update entities in Neo4j with observations.
+    Replaces neo4j-memory-remote:create_entities + add_observations.
+    
+    Args:
+        entities: List of entity dicts, each with:
+            - name (str, required): Entity name
+            - type (str): Entity type (default: "concept")
+            - observations (list[str]): Facts about this entity
+        check_existing: If True, MERGE instead of CREATE (dedup)
+    
+    Returns:
+        Dict with created, updated, and total counts
+    """
+    try:
+        created = 0
+        updated = 0
+
+        async with neo4j_session() as session:
+            for entity in entities:
+                name = entity.get("name")
+                if not name:
+                    continue
+                entity_type = entity.get("type", "concept")
+                observations = entity.get("observations", [])
+
+                if check_existing:
+                    # MERGE: create if not exists, update if exists
+                    result = session.run("""
+                        MERGE (e:Entity {name: $name})
+                        ON CREATE SET
+                            e.type = $type,
+                            e.observations = $observations,
+                            e.created_at = datetime(),
+                            e.updated_at = datetime()
+                        ON MATCH SET
+                            e.type = CASE WHEN e.type = 'concept' THEN $type ELSE e.type END,
+                            e.observations = e.observations + [obs IN $observations WHERE NOT obs IN e.observations],
+                            e.updated_at = datetime()
+                        RETURN
+                            CASE WHEN e.created_at = e.updated_at THEN 'created' ELSE 'updated' END as action
+                    """, {
+                        "name": name,
+                        "type": entity_type,
+                        "observations": observations
+                    })
+                    action = result.single()["action"]
+                    if action == "created":
+                        created += 1
+                    else:
+                        updated += 1
+                else:
+                    session.run("""
+                        CREATE (e:Entity {
+                            name: $name,
+                            type: $type,
+                            observations: $observations,
+                            created_at: datetime(),
+                            updated_at: datetime()
+                        })
+                    """, {
+                        "name": name,
+                        "type": entity_type,
+                        "observations": observations
+                    })
+                    created += 1
+
+        return {
+            "status": "success",
+            "created": created,
+            "updated": updated,
+            "total": created + updated,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+
+# ============================================================================
+# Tool 5: manage_relationships (create relationships between entities)
+# ============================================================================
+
+async def manage_relationships(
+    relationships: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Create relationships between entities in Neo4j.
+    Replaces neo4j-memory-remote:create_relations.
+    
+    Args:
+        relationships: List of relationship dicts, each with:
+            - from_entity (str, required): Source entity name
+            - to_entity (str, required): Target entity name  
+            - rel_type (str): Relationship type (default: "RELATES_TO")
+            - context (str): Optional context/description
+    
+    Returns:
+        Dict with created count
+    """
+    try:
+        created = 0
+
+        async with neo4j_session() as session:
+            for rel in relationships:
+                from_name = rel.get("from_entity")
+                to_name = rel.get("to_entity")
+                if not from_name or not to_name:
+                    continue
+                rel_type = rel.get("rel_type", "RELATES_TO").upper().replace(" ", "_")
+                context = rel.get("context", "")
+
+                # MERGE both entities (they should exist but be safe)
+                # then MERGE the relationship
+                session.run(f"""
+                    MERGE (a:Entity {{name: $from_name}})
+                    ON CREATE SET a.type = 'concept',
+                                  a.observations = [],
+                                  a.created_at = datetime(),
+                                  a.updated_at = datetime()
+                    MERGE (b:Entity {{name: $to_name}})
+                    ON CREATE SET b.type = 'concept',
+                                  b.observations = [],
+                                  b.created_at = datetime(),
+                                  b.updated_at = datetime()
+                    MERGE (a)-[r:{rel_type}]->(b)
+                    SET r.context = $context,
+                        r.updated_at = datetime()
+                """, {
+                    "from_name": from_name,
+                    "to_name": to_name,
+                    "context": context
+                })
+                created += 1
+
+        return {
+            "status": "success",
+            "created": created,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+
+# ============================================================================
+# Tool 6: search_entities (find existing entities for dedup)
+# ============================================================================
+
+async def search_entities(
+    query: str,
+    entity_type: Optional[str] = None,
+    limit: int = 20
+) -> Dict[str, Any]:
+    """
+    Search for entities in Neo4j by name (substring match).
+    Replaces neo4j-memory-remote:search_memories and find_memories_by_name.
+    
+    Args:
+        query: Search string (matched against entity name, case-insensitive)
+        entity_type: Optional filter by entity type
+        limit: Maximum results
+    
+    Returns:
+        Dict with matching entities and their observations
+    """
+    try:
+        entities = []
+
+        async with neo4j_session() as session:
+            type_filter = "AND e.type = $entity_type" if entity_type else ""
+            result = session.run(f"""
+                MATCH (e:Entity)
+                WHERE toLower(e.name) CONTAINS toLower($query)
+                {type_filter}
+                OPTIONAL MATCH (e)<-[:MENTIONS|REFERENCES]-(d:Document)
+                WITH e, collect(DISTINCT d.title) as mentioned_in
+                RETURN e.name as name,
+                       e.type as type,
+                       e.observations as observations,
+                       e.created_at as created_at,
+                       e.updated_at as updated_at,
+                       mentioned_in
+                ORDER BY e.name
+                LIMIT $limit
+            """, {
+                "query": query,
+                "entity_type": entity_type or "",
+                "limit": limit
+            })
+
+            for record in result:
+                entities.append({
+                    "name": record["name"],
+                    "type": record["type"],
+                    "observations": record["observations"] or [],
+                    "created_at": str(record["created_at"]) if record["created_at"] else None,
+                    "updated_at": str(record["updated_at"]) if record["updated_at"] else None,
+                    "mentioned_in_documents": record["mentioned_in"]
+                })
+
+        return {
+            "status": "success",
+            "query": query,
+            "results": entities,
+            "total": len(entities),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
     except Exception as e:
         return {
             "status": "error",
