@@ -156,7 +156,7 @@ def get_neo4j_driver():
 async def sync_to_tos(
     patterns: List[Dict[str, Any]],
     target: str = "both",
-    collection: str = "ebatt_pattern_library"
+    collection: str = "ebatt_patterns_v2"
 ) -> Dict[str, Any]:
     """
     Sync extracted patterns to TOS (Qdrant and/or Neo4j).
