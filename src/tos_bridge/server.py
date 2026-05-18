@@ -529,7 +529,7 @@ async def find_entities(
 @mcp.tool()
 async def run_cypher(
     query: str,
-    params: Optional[Dict[str, Any]] = None,
+    params: Dict[str, Any] = {},
     read_only: bool = True,
     limit: int = 100,
 ) -> Dict[str, Any]:
@@ -677,7 +677,7 @@ async def hybrid_search(
     collection: str,
     limit: int = 10,
     title_filter: Optional[str] = None,
-    payload_filter: Optional[Dict[str, Any]] = None,
+    payload_filter: Dict[str, Any] = {},
 ) -> Dict[str, Any]:
     """Dense semantic search with optional payload filtering.
 
