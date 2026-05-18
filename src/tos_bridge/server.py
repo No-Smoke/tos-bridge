@@ -353,9 +353,9 @@ async def store_doc_with_graph(
     title: str,
     path: Optional[str] = None,
     summary: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-    entities: Optional[List[Dict[str, Any]]] = None,
-    relationships: Optional[List[Dict[str, Any]]] = None
+    metadata: Dict[str, Any] = {},
+    entities: List[Dict[str, Any]] = [],
+    relationships: List[Dict[str, Any]] = []
 ) -> Dict[str, Any]:
     """
     Store document in Qdrant with Neo4j graph cross-reference.
