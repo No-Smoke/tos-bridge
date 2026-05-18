@@ -130,6 +130,25 @@ def _truncate_for_embedding(text: str, max_chars: int = 1400) -> str:
     return truncated
 
 
+def _connection_error_hint(underlying: Exception) -> str:
+    """Format a clear error message when Ollama is unreachable.
+
+    The bare httpx.ConnectError message is "All connection attempts failed"
+    with no URL or remediation hint, which is opaque when an MCP server's
+    env block drops OLLAMA_URL and the embedder silently falls back to
+    localhost:11434. Surface the URL we tried and point operators at the
+    config they need to fix.
+    """
+    return (
+        f"Cannot reach Ollama at {OLLAMA_URL}. "
+        f"If OLLAMA_URL is unset, the embedding module falls back to "
+        f"http://localhost:11434 — set OLLAMA_URL in the MCP server's "
+        f"env (e.g. ~/.claude.json mcpServers.<name>.env) and restart "
+        f"the MCP process so the new env is inherited. "
+        f"Underlying: {underlying!r}"
+    )
+
+
 async def _get_embedding_raw(
     text: str,
     model: str,
@@ -137,18 +156,21 @@ async def _get_embedding_raw(
 ) -> List[float]:
     """Raw embedding function without circuit breaker (internal use)."""
     text = _truncate_for_embedding(text)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{OLLAMA_URL}/api/embed",
-            json={
-                "model": model,
-                "input": text,
-                "truncate": True,
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["embeddings"][0]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/embed",
+                json={
+                    "model": model,
+                    "input": text,
+                    "truncate": True,
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["embeddings"][0]
+    except httpx.ConnectError as e:
+        raise httpx.ConnectError(_connection_error_hint(e)) from e
 
 
 async def get_embedding(
@@ -288,27 +310,30 @@ async def get_embeddings_batch(
 
     # Chunked batch call to Ollama. Failures here propagate; the circuit
     # breaker is updated by the eventual exception path.
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for chunk_start in range(0, len(miss_texts), batch_size):
-            chunk = miss_texts[chunk_start:chunk_start + batch_size]
-            chunk_keys = miss_keys[chunk_start:chunk_start + batch_size]
-            chunk_indices = miss_indices[chunk_start:chunk_start + batch_size]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for chunk_start in range(0, len(miss_texts), batch_size):
+                chunk = miss_texts[chunk_start:chunk_start + batch_size]
+                chunk_keys = miss_keys[chunk_start:chunk_start + batch_size]
+                chunk_indices = miss_indices[chunk_start:chunk_start + batch_size]
 
-            response = await client.post(
-                f"{OLLAMA_URL}/api/embed",
-                json={"model": model, "input": chunk, "truncate": True},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            embeddings = payload.get("embeddings") or []
-            if len(embeddings) != len(chunk):
-                raise RuntimeError(
-                    f"Ollama returned {len(embeddings)} embeddings for {len(chunk)} inputs"
+                response = await client.post(
+                    f"{OLLAMA_URL}/api/embed",
+                    json={"model": model, "input": chunk, "truncate": True},
                 )
+                response.raise_for_status()
+                payload = response.json()
+                embeddings = payload.get("embeddings") or []
+                if len(embeddings) != len(chunk):
+                    raise RuntimeError(
+                        f"Ollama returned {len(embeddings)} embeddings for {len(chunk)} inputs"
+                    )
 
-            for i, key, vec in zip(chunk_indices, chunk_keys, embeddings):
-                _cache_put(key, vec)
-                results[i] = vec
+                for i, key, vec in zip(chunk_indices, chunk_keys, embeddings):
+                    _cache_put(key, vec)
+                    results[i] = vec
+    except httpx.ConnectError as e:
+        raise httpx.ConnectError(_connection_error_hint(e)) from e
 
     # All slots filled; pacify the type checker.
     return [r for r in results if r is not None]  # type: ignore[misc]
@@ -380,5 +405,7 @@ async def warmup_ollama(model: Optional[str] = None) -> bool:
         return True
         
     except Exception as e:
-        logger.warning(f"Ollama warmup failed (non-fatal): {e}")
+        logger.warning(
+            f"Ollama warmup failed at {OLLAMA_URL} (non-fatal): {e!r}"
+        )
         return False
