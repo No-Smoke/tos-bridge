@@ -16,10 +16,13 @@ from typing import List, Dict, Any, Optional
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from neo4j import GraphDatabase
 from pydantic import BaseModel, Field
+
+from .arg_recovery import split_leaked_envelope
 
 # Import graph-enhanced tools
 from .graph_tools import (
@@ -349,8 +352,8 @@ async def check_tos_health() -> Dict[str, Any]:
 @mcp.tool()
 async def store_doc_with_graph(
     text: str,
-    collection: str,
-    title: str,
+    collection: str = "",
+    title: str = "",
     path: Optional[str] = None,
     summary: Optional[str] = None,
     metadata: Dict[str, Any] = {},
@@ -359,29 +362,63 @@ async def store_doc_with_graph(
 ) -> Dict[str, Any]:
     """
     Store document in Qdrant with Neo4j graph cross-reference.
-    
+
     Args:
         text: Document content for embedding
-        collection: Qdrant collection name
-        title: Document title
+        collection: Qdrant collection name (always supply this)
+        title: Document title (always supply this)
         path: Optional file path
         summary: Optional brief summary
         metadata: Additional metadata for Qdrant
         entities: List of entities [{name, type, importance}]
         relationships: List of relationships [{target, rel_type, context}]
-    
+
     Returns:
         qdrant_id, neo4j_id, entities_created, relationships_created
     """
+    supplied = {
+        "collection": collection,
+        "title": title,
+        "path": path,
+        "summary": summary,
+        "metadata": metadata,
+        "entities": entities,
+        "relationships": relationships,
+    }
+
+    # `collection` and `title` carry defaults so that a call whose parameters
+    # were folded into `text` by a malformed tool-call envelope still reaches
+    # this function; client-side schema validation would otherwise reject it
+    # before the envelope could be unpicked.
+    if not collection or not title:
+        text, recovered = split_leaked_envelope(text)
+        if recovered:
+            logger.warning(
+                "Recovered parameters from a leaked tool-call envelope",
+                extra={"event": "envelope_recovered", "params": sorted(recovered)},
+            )
+            for key, value in recovered.items():
+                if not supplied.get(key):
+                    supplied[key] = value
+
+    missing = [k for k in ("collection", "title") if not supplied[k]]
+    if missing:
+        raise ToolError(
+            f"store_doc_with_graph received no {' and no '.join(missing)}. "
+            "Nothing was stored. This is a malformed tool call: the parameters "
+            "were never transmitted, so re-send the call with every parameter "
+            "closed by its own delimiter. Shorter text is less likely to trip it."
+        )
+
     return await store_document_with_graph(
         text=text,
-        collection=collection,
-        title=title,
-        path=path,
-        summary=summary,
-        metadata=metadata,
-        entities=entities,
-        relationships=relationships
+        collection=supplied["collection"],
+        title=supplied["title"],
+        path=supplied["path"],
+        summary=supplied["summary"],
+        metadata=supplied["metadata"],
+        entities=supplied["entities"],
+        relationships=supplied["relationships"],
     )
 
 

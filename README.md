@@ -31,6 +31,13 @@ named vectors (e.g. `dense`) and unnamed default vectors automatically.
 - `relationships`: `[{target, rel_type, context}]` — creates additional typed edges
 - Returns: `qdrant_id`, `neo4j_id`, entity/relationship counts
 
+`collection` and `title` are semantically required but carry `""` defaults so the
+call still reaches the server when a malformed tool-call envelope folds them into
+`text`; the server unpicks the envelope and stores the document correctly. When
+they are genuinely absent nothing is stored and the error names that cause,
+instead of the misleading "expected string, received undefined". See
+[`arg_recovery.py`](src/tos_bridge/arg_recovery.py).
+
 **`search_with_graph`** — Graph-enhanced semantic search (GraphRAG).
 Embeds the query, searches Qdrant, then expands results via Neo4j shared-entity
 traversal. Documents connected through the knowledge graph get score boosts.
