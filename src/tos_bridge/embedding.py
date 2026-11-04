@@ -16,7 +16,7 @@ import hashlib
 import asyncio
 import logging
 from collections import OrderedDict
-from typing import List, Optional
+from typing import Awaitable, Callable, Iterator, List, Optional, Tuple, TypeVar
 
 import httpx
 
@@ -25,6 +25,26 @@ logger = logging.getLogger("tos-bridge.embedding")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
+
+# Ollama's `prompt_eval_count` stops at the model's context window for input it
+# truncated silently (measured: mxbai-embed-large reports exactly 512), so
+# reaching this value means the end of the text never reached the model.
+OLLAMA_EMBED_CONTEXT_TOKENS = int(os.getenv("OLLAMA_EMBED_CONTEXT_TOKENS", "512"))
+
+# Measured against mxbai-embed-large on Ollama 0.20.5: 1,400 chars of English is
+# 303 tokens, so this fits ordinary prose. Denser text is split further by
+# embed_document, on the model's own signal rather than a character estimate.
+CHUNK_MAX_CHARS = 1200
+_MIN_SPLIT_CHARS = 64
+
+SHRINK_RATIOS = (1.0, 0.75, 0.5, 0.35, 0.25)
+_CONTEXT_ERROR = "exceeds the context length"
+
+T = TypeVar("T")
+
+
+class EmbeddingContextExceeded(Exception):
+    """Ollama rejected the input as longer than the model's context window."""
 
 # Bounded LRU cache for single-text embeddings.
 # `OrderedDict.move_to_end` gives us O(1) recency without a separate LRU library.
@@ -112,12 +132,12 @@ embedding_circuit_breaker = EmbeddingCircuitBreaker()
 
 def _truncate_for_embedding(text: str, max_chars: int = 1400) -> str:
     """
-    Client-side pre-filter before Ollama's server-side truncation.
+    Client-side cap on single-string embedding, for queries and patterns.
 
-    Ollama's /api/embed with truncate:true is authoritative, but capping
-    here reduces wire bytes and tokenizer work on pathological inputs.
-    1400 chars is safe even for short-token text (~2 chars/token) against
-    mxbai-embed-large's 512-token window. Cuts at word boundary.
+    This bounds wire bytes and tokenizer work; it does NOT make the input safe.
+    Ollama returns HTTP 400 on token-dense text well under this cap even with
+    truncate:true, so callers go through the SHRINK_RATIOS retry. Documents do
+    not use this path at all: see embed_document. Cuts at a word boundary.
     """
     if len(text) <= max_chars:
         return text
@@ -128,6 +148,29 @@ def _truncate_for_embedding(text: str, max_chars: int = 1400) -> str:
         truncated = truncated[:last_space]
     logger.debug(f"Truncated embedding input from {len(text)} to {len(truncated)} chars")
     return truncated
+
+
+def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
+    """Split text into contiguous spans of at most max_chars.
+
+    Prefers paragraph, line, sentence, then word boundaries in the back half of
+    each window. ``"".join(split_text(t)) == t`` always holds: a document is read
+    back by concatenating its spans, so no character may be dropped or repeated.
+    """
+    spans: List[str] = []
+    rest = text
+    while len(rest) > max_chars:
+        window = rest[:max_chars]
+        cut = max_chars
+        for boundary in ("\n\n", "\n", ". ", " "):
+            found = window.rfind(boundary)
+            if found >= max_chars // 2:
+                cut = found + len(boundary)
+                break
+        spans.append(rest[:cut])
+        rest = rest[cut:]
+    spans.append(rest)
+    return spans
 
 
 def _connection_error_hint(underlying: Exception) -> str:
@@ -149,13 +192,25 @@ def _connection_error_hint(underlying: Exception) -> str:
     )
 
 
-async def _get_embedding_raw(
+def _shrink_candidates(text: str) -> Iterator[str]:
+    """Yield `text`, then ever-shorter prefixes, for retrying on a context error."""
+    for ratio in SHRINK_RATIOS:
+        yield text if ratio == 1.0 else text[:max(1, int(len(text) * ratio))]
+
+
+def _raise_for_embed_status(response: httpx.Response) -> None:
+    """Raise EmbeddingContextExceeded for an over-long input, else the HTTP error."""
+    if response.status_code in (400, 500) and _CONTEXT_ERROR in response.text:
+        raise EmbeddingContextExceeded(response.text)
+    response.raise_for_status()
+
+
+async def _post_embed(
     text: str,
     model: str,
-    timeout: float = 60.0
-) -> List[float]:
-    """Raw embedding function without circuit breaker (internal use)."""
-    text = _truncate_for_embedding(text)
+    timeout: float,
+) -> Tuple[List[float], Optional[int]]:
+    """One /api/embed call. Returns the vector and Ollama's prompt token count."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
@@ -166,11 +221,93 @@ async def _get_embedding_raw(
                     "truncate": True,
                 }
             )
-            response.raise_for_status()
-            data = response.json()
-            return data["embeddings"][0]
     except httpx.ConnectError as e:
         raise httpx.ConnectError(_connection_error_hint(e)) from e
+    _raise_for_embed_status(response)
+    data = response.json()
+    return data["embeddings"][0], data.get("prompt_eval_count")
+
+
+async def _get_embedding_raw(
+    text: str,
+    model: str,
+    timeout: float = 60.0
+) -> List[float]:
+    """Embed one string, shrinking on Ollama's context-length error.
+
+    truncate:true does not reliably truncate: token density, not character
+    count, decides whether Ollama returns 400, so no fixed cap is safe. A query
+    must still produce a vector, so this retries on a shorter prefix.
+    """
+    text = _truncate_for_embedding(text)
+    for payload in _shrink_candidates(text):
+        try:
+            vector, _ = await _post_embed(payload, model, timeout)
+        except EmbeddingContextExceeded:
+            logger.info("Embedding input of %d chars over context; shrinking", len(payload))
+            continue
+        return vector
+    raise EmbeddingContextExceeded(
+        f"Input of {len(text)} chars exceeds the context of {model} at every shrink step"
+    )
+
+
+async def _with_retries(
+    operation: Callable[[], Awaitable[T]],
+    max_retries: int = 5,
+) -> T:
+    """Run an Ollama call with the circuit breaker and exponential backoff.
+
+    EmbeddingContextExceeded is a verdict on the input, not on the service, so it
+    propagates at once: retrying is pointless and it must not trip the breaker.
+    """
+    # Check circuit breaker state before entering retry loop.
+    # This prevents retries from cascading into breaker trips —
+    # the breaker only counts one failure per top-level call,
+    # not one per retry attempt.
+    if embedding_circuit_breaker.state == "open":
+        if embedding_circuit_breaker.last_failure_time and \
+           time.time() - embedding_circuit_breaker.last_failure_time > embedding_circuit_breaker.reset_timeout:
+            embedding_circuit_breaker.state = "half-open"
+            logger.info("Embedding circuit breaker half-open (pre-retry check)")
+        else:
+            raise Exception("Embedding service circuit breaker open - too many failures")
+
+    for attempt in range(max_retries):
+        try:
+            result = await operation()
+            # Success — reset breaker if it was half-open
+            if embedding_circuit_breaker.state == "half-open":
+                embedding_circuit_breaker.state = "closed"
+                embedding_circuit_breaker.failure_count = 0
+                logger.info("Embedding circuit breaker closed - service recovered")
+            elif embedding_circuit_breaker.failure_count > 0:
+                # Successful call after some failures — decay the counter
+                embedding_circuit_breaker.failure_count = max(0, embedding_circuit_breaker.failure_count - 1)
+            if attempt > 0:
+                logger.info(f"Embedding succeeded on retry {attempt}")
+            return result
+
+        except EmbeddingContextExceeded:
+            raise
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # All retries exhausted — NOW record one failure on the breaker
+                embedding_circuit_breaker.failure_count += 1
+                embedding_circuit_breaker.last_failure_time = time.time()
+                if embedding_circuit_breaker.failure_count >= embedding_circuit_breaker.failure_threshold:
+                    embedding_circuit_breaker.state = "open"
+                    logger.error(f"Embedding circuit breaker opened after {embedding_circuit_breaker.failure_count} top-level failures")
+                logger.error(f"Embedding failed after {max_retries} attempts: {e}")
+                raise e
+
+            # Exponential backoff: 1s, 2s, 4s, 8s
+            wait_time = min(2 ** attempt, 8)
+            logger.warning(f"Embedding attempt {attempt + 1} failed, retrying in {wait_time}s: {e}")
+            await asyncio.sleep(wait_time)
+
+    raise ValueError(f"max_retries must be at least 1, got {max_retries}")
 
 
 async def get_embedding(
@@ -181,6 +318,9 @@ async def get_embedding(
 ) -> List[float]:
     """
     Generate embedding using Ollama with circuit breaker and retry logic.
+
+    Over-long input is shrunk, so the vector may cover only a prefix of `text`.
+    That suits a query; use embed_document for content that must stay findable.
 
     Args:
         text: Text to embed
@@ -202,51 +342,55 @@ async def get_embedding(
     if cached is not None:
         return cached
 
-    # Check circuit breaker state before entering retry loop.
-    # This prevents retries from cascading into breaker trips —
-    # the breaker only counts one failure per top-level call,
-    # not one per retry attempt.
-    if embedding_circuit_breaker.state == "open":
-        if embedding_circuit_breaker.last_failure_time and \
-           time.time() - embedding_circuit_breaker.last_failure_time > embedding_circuit_breaker.reset_timeout:
-            embedding_circuit_breaker.state = "half-open"
-            logger.info("Embedding circuit breaker half-open (pre-retry check)")
-        else:
-            raise Exception("Embedding service circuit breaker open - too many failures")
+    result = await _with_retries(
+        lambda: _get_embedding_raw(text, model, timeout), max_retries
+    )
+    _cache_put(cache_key, result)
+    return result
 
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            result = await _get_embedding_raw(text, model, timeout)
-            _cache_put(cache_key, result)
-            # Success — reset breaker if it was half-open
-            if embedding_circuit_breaker.state == "half-open":
-                embedding_circuit_breaker.state = "closed"
-                embedding_circuit_breaker.failure_count = 0
-                logger.info("Embedding circuit breaker closed - service recovered")
-            elif embedding_circuit_breaker.failure_count > 0:
-                # Successful call after some failures — decay the counter
-                embedding_circuit_breaker.failure_count = max(0, embedding_circuit_breaker.failure_count - 1)
-            if attempt > 0:
-                logger.info(f"Embedding succeeded on retry {attempt}")
-            return result
 
-        except Exception as e:
-            last_error = e
-            if attempt == max_retries - 1:
-                # All retries exhausted — NOW record one failure on the breaker
-                embedding_circuit_breaker.failure_count += 1
-                embedding_circuit_breaker.last_failure_time = time.time()
-                if embedding_circuit_breaker.failure_count >= embedding_circuit_breaker.failure_threshold:
-                    embedding_circuit_breaker.state = "open"
-                    logger.error(f"Embedding circuit breaker opened after {embedding_circuit_breaker.failure_count} top-level failures")
-                logger.error(f"Embedding failed after {max_retries} attempts: {e}")
-                raise e
+async def _embed_span(
+    span: str,
+    model: str,
+    timeout: float,
+) -> List[Tuple[str, List[float]]]:
+    """Embed a span whole, splitting it wherever the model could not take it all."""
+    fits = True
+    vector: List[float] = []
+    try:
+        vector, tokens = await _with_retries(lambda: _post_embed(span, model, timeout))
+        # Silent truncation returns 200; only the token count gives it away.
+        fits = tokens is None or tokens < OLLAMA_EMBED_CONTEXT_TOKENS
+    except EmbeddingContextExceeded:
+        fits = False
 
-            # Exponential backoff: 1s, 2s, 4s, 8s
-            wait_time = min(2 ** attempt, 8)
-            logger.warning(f"Embedding attempt {attempt + 1} failed, retrying in {wait_time}s: {e}")
-            await asyncio.sleep(wait_time)
+    if fits:
+        return [(span, vector)]
+    if len(span) <= _MIN_SPLIT_CHARS:
+        return [(span, vector or await _get_embedding_raw(span, model, timeout))]
+
+    pairs: List[Tuple[str, List[float]]] = []
+    for part in split_text(span, max_chars=len(span) * 2 // 3):
+        pairs.extend(await _embed_span(part, model, timeout))
+    return pairs
+
+
+async def embed_document(
+    text: str,
+    model: Optional[str] = None,
+    timeout: float = 60.0,
+) -> List[Tuple[str, List[float]]]:
+    """Embed a whole document so that every character reaches the model.
+
+    Returns (span, vector) pairs in document order, and the spans concatenate to
+    exactly `text`. Results skip the LRU cache, which get_embedding fills with
+    vectors that may cover only a shrunk prefix.
+    """
+    model = model or OLLAMA_EMBED_MODEL
+    pairs: List[Tuple[str, List[float]]] = []
+    for span in split_text(text):
+        pairs.extend(await _embed_span(span, model, timeout))
+    return pairs
 
 
 async def get_embeddings_batch(
@@ -321,9 +465,15 @@ async def get_embeddings_batch(
                     f"{OLLAMA_URL}/api/embed",
                     json={"model": model, "input": chunk, "truncate": True},
                 )
-                response.raise_for_status()
-                payload = response.json()
-                embeddings = payload.get("embeddings") or []
+                try:
+                    _raise_for_embed_status(response)
+                except EmbeddingContextExceeded:
+                    # One dense text fails the whole request, so isolate it.
+                    embeddings = [
+                        await _get_embedding_raw(item, model, timeout) for item in chunk
+                    ]
+                else:
+                    embeddings = response.json().get("embeddings") or []
                 if len(embeddings) != len(chunk):
                     raise RuntimeError(
                         f"Ollama returned {len(embeddings)} embeddings for {len(chunk)} inputs"
@@ -357,18 +507,25 @@ def get_embedding_sync(
     """
     model = model or OLLAMA_EMBED_MODEL
     text = _truncate_for_embedding(text)
-    
+
     with httpx.Client(timeout=timeout) as client:
-        response = client.post(
-            f"{OLLAMA_URL}/api/embed",
-            json={
-                "model": model,
-                "input": text,
-                "truncate": True,
-            }
-        )
-        response.raise_for_status()
-        return response.json()["embeddings"][0]
+        for payload in _shrink_candidates(text):
+            response = client.post(
+                f"{OLLAMA_URL}/api/embed",
+                json={
+                    "model": model,
+                    "input": payload,
+                    "truncate": True,
+                }
+            )
+            try:
+                _raise_for_embed_status(response)
+            except EmbeddingContextExceeded:
+                continue
+            return response.json()["embeddings"][0]
+    raise EmbeddingContextExceeded(
+        f"Input of {len(text)} chars exceeds the context of {model} at every shrink step"
+    )
 
 
 async def warmup_ollama(model: Optional[str] = None) -> bool:

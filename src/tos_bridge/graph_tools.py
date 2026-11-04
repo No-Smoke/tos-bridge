@@ -19,11 +19,11 @@ from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct, Range
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, TransientError
 
-from .embedding import get_embedding
+from .embedding import CHUNK_MAX_CHARS, embed_document, get_embedding
 
 logger = logging.getLogger("tos-bridge.graph")
 
@@ -76,6 +76,88 @@ def _stable_doc_id(path: Optional[str], title: str) -> str:
     if not key:
         key = f"title:{title}"
     return str(uuid.uuid5(_TOS_NAMESPACE, key))
+
+
+# Bookkeeping fields on stored points; caller metadata may not set these.
+_CHUNK_FIELDS = ("text", "parent_id", "chunk_index", "chunk_count")
+
+# Fields that hold a document's text, in priority order. `text` is what this
+# server writes. `body` is the store-time workaround callers passed as
+# metadata.body, which the old payload spread flattened to the top level, and
+# `_document` comes from an older writer. A point may predate all of them.
+_BODY_FIELDS = ("text", "body", "_document")
+
+_UPSERT_BATCH = 64
+_SEARCH_MAX_PAGES = 8
+
+
+def _chunk_point_id(doc_id: str, index: int) -> str:
+    """Deterministic id of a continuation chunk. Chunk 0 is the document's own point."""
+    return str(uuid.uuid5(_TOS_NAMESPACE, f"{doc_id}#chunk-{index}"))
+
+
+def _document_id(hit: Any) -> str:
+    """The id of the document a point belongs to: its parent's, or its own."""
+    return (hit.payload or {}).get("parent_id") or str(hit.id)
+
+
+def _stored_body(payload: Dict[str, Any]) -> tuple:
+    """Return (text, field it came from) for a point, or ("", None) if it has none."""
+    for field in _BODY_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            return value, field
+    nested = payload.get("metadata")
+    if isinstance(nested, dict):
+        value = nested.get("body")
+        if isinstance(value, str) and value:
+            return value, "metadata.body"
+    return "", None
+
+
+def _excerpt(payload: Dict[str, Any]) -> str:
+    """Text for a search result: the matched chunk, or the head of a legacy body."""
+    return _stored_body(payload)[0][:CHUNK_MAX_CHARS]
+
+
+def _search_documents(
+    client: QdrantClient,
+    collection: str,
+    query_vector: List[float],
+    limit: int,
+    vector_name: Optional[str] = None,
+    query_filter: Optional[Filter] = None,
+) -> List[Any]:
+    """Return up to `limit` hits from distinct documents, best chunk per document.
+
+    A long document can fill a whole page of hits, so this pages until it has
+    enough documents, doubling the page so that a document of thousands of chunks
+    costs few round trips. It dedupes here rather than with Qdrant's group-by,
+    because group-by drops points without the group field, and that is every
+    legacy point.
+    """
+    page_size = max(limit * 3, 30)
+    offset = 0
+    best: Dict[str, Any] = {}
+    kwargs: Dict[str, Any] = {
+        "collection_name": collection,
+        "query": query_vector,
+        "with_payload": True,
+    }
+    if vector_name:
+        kwargs["using"] = vector_name
+    if query_filter:
+        kwargs["query_filter"] = query_filter
+
+    for _ in range(_SEARCH_MAX_PAGES):
+        hits = client.query_points(limit=page_size, offset=offset, **kwargs).points
+        for hit in hits:
+            best.setdefault(_document_id(hit), hit)  # Pages arrive best-first
+        if len(best) >= limit or len(hits) < page_size:
+            break
+        offset += page_size
+        page_size *= 2
+    return list(best.values())[:limit]
 
 
 def _utcnow_iso() -> str:
@@ -274,20 +356,24 @@ async def store_document_with_graph(
     Store document in Qdrant with Neo4j graph cross-reference.
     
     Args:
-        text: Document content for embedding
+        text: Document content, stored in full and embedded in full
         collection: Qdrant collection name
         title: Document title
-        path: Optional file path
+        path: Optional file path; the document's identity, so re-storing replaces
         summary: Optional brief summary (defaults to first 200 chars)
         metadata: Additional metadata for Qdrant
         entities: List of entities [{name, type, importance}]
         relationships: List of relationships [{target, rel_type, context}]
     
     Returns:
-        Dict with qdrant_id, neo4j_id, entities_created, relationships_created
+        Dict with qdrant_id, neo4j_id, entities_created, relationships_created,
+        chunks, body_chars
     """
-    # 1. Generate embedding (may raise — let it propagate)
-    embedding = await get_embedding(text)
+    if not text:
+        raise ValueError("store_document_with_graph received empty text; nothing was stored")
+
+    # 1. Embed every span of the document (may raise — let it propagate)
+    embedded = await embed_document(text)
 
     # 2. Compute a stable Qdrant point id from path/title so re-stores update
     #    the same record instead of creating duplicates.
@@ -295,23 +381,50 @@ async def store_document_with_graph(
     entity_names = [e.get("name") for e in (entities or [])]
     doc_summary = summary or text[:200]
 
-    qdrant_metadata = {
+    shared_payload = {
         "title": title,
         "path": path or "",
         "summary": doc_summary,
         "neo4j_entities": entity_names,
         "synced_at": _utcnow_iso(),
-        **(metadata or {}),
+        **{k: v for k, v in (metadata or {}).items() if k not in _CHUNK_FIELDS},
     }
 
-    # 3. Upsert to Qdrant (idempotent because the id is deterministic)
+    # 3. Upsert to Qdrant (idempotent because the ids are deterministic).
+    #    Point 0 is the document and keeps the path-derived id. Continuation
+    #    chunks carry the shared fields so payload filters still match them,
+    #    but not a caller-supplied `body`, which would be copied onto every one.
     qdrant_client = get_qdrant_client()
     vector_name = _get_collection_vector_name(qdrant_client, collection)
-    point_vector = {vector_name: embedding} if vector_name else embedding
+    chunk_count = len(embedded)
+    chunk_payload = {k: v for k, v in shared_payload.items() if k != "body"}
 
+    def make_point(index: int, span: str, embedding: List[float]) -> PointStruct:
+        base = {**chunk_payload, "parent_id": qdrant_id} if index else shared_payload
+        return PointStruct(
+            id=_chunk_point_id(qdrant_id, index) if index else qdrant_id,
+            vector={vector_name: embedding} if vector_name else embedding,
+            payload={**base, "text": span, "chunk_index": index, "chunk_count": chunk_count},
+        )
+
+    continuation = [make_point(i, *pair) for i, pair in enumerate(embedded) if i]
+    for start in range(0, len(continuation), _UPSERT_BATCH):
+        qdrant_client.upsert(
+            collection_name=collection,
+            points=continuation[start:start + _UPSERT_BATCH],
+        )
+    # The document point goes last: its chunk_count is what readers trust, so an
+    # upsert that dies part-way leaves the previous version readable.
     qdrant_client.upsert(
         collection_name=collection,
-        points=[PointStruct(id=qdrant_id, vector=point_vector, payload=qdrant_metadata)],
+        points=[make_point(0, *embedded[0])],
+    )
+    qdrant_client.delete(
+        collection_name=collection,
+        points_selector=Filter(must=[
+            FieldCondition(key="parent_id", match=MatchValue(value=qdrant_id)),
+            FieldCondition(key="chunk_index", range=Range(gte=chunk_count)),
+        ]),
     )
 
     # 4. MERGE Document node and create relationships in Neo4j
@@ -400,6 +513,75 @@ async def store_document_with_graph(
         "collection": collection,
         "entities_created": entities_created,
         "relationships_created": rels_created,
+        "chunks": chunk_count,
+        "body_chars": len(text),
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def get_document_tool(
+    collection: str,
+    path: Optional[str] = None,
+    title: Optional[str] = None,
+    qdrant_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read a stored document's full text back from Qdrant.
+
+    Args:
+        collection: Qdrant collection name.
+        path: The path it was stored under.
+        title: The title it was stored under, for a document with no path.
+        qdrant_id: The id from a store or search result; wins over path and title.
+
+    Returns:
+        Dict with text, body_source (the payload field it came from, or None for
+        a point stored before bodies were kept), complete, chunk_count and the
+        document's remaining payload fields.
+    """
+    if not (qdrant_id or path or title):
+        raise ValueError("get_document requires one of qdrant_id, path or title")
+    doc_id = qdrant_id or _stable_doc_id(path, title or "")
+    client = get_qdrant_client()
+
+    found = client.retrieve(collection_name=collection, ids=[doc_id], with_payload=True)
+    if found and (found[0].payload or {}).get("parent_id"):
+        doc_id = found[0].payload["parent_id"]
+        found = client.retrieve(collection_name=collection, ids=[doc_id], with_payload=True)
+    if not found:
+        return {
+            "status": "not_found",
+            "qdrant_id": doc_id,
+            "collection": collection,
+            "timestamp": _utcnow_iso(),
+        }
+
+    payload = found[0].payload or {}
+    text, body_source = _stored_body(payload)
+    chunk_count = payload.get("chunk_count")
+    complete = True
+    if isinstance(chunk_count, int) and chunk_count > 1:
+        ids = [_chunk_point_id(doc_id, i) for i in range(1, chunk_count)]
+        chunks = client.retrieve(collection_name=collection, ids=ids, with_payload=True)
+        by_index = {c.payload.get("chunk_index"): c.payload.get("text", "") for c in chunks}
+        complete = all(i in by_index for i in range(1, chunk_count))
+        text += "".join(by_index[i] for i in sorted(by_index))
+
+    return {
+        "status": "success",
+        "qdrant_id": doc_id,
+        "collection": collection,
+        "title": payload.get("title", ""),
+        "path": payload.get("path", ""),
+        "summary": payload.get("summary", ""),
+        "text": text,
+        "chars": len(text),
+        "body_source": body_source,
+        "complete": complete,
+        "chunk_count": chunk_count or 1,
+        "payload": {
+            k: v for k, v in payload.items()
+            if k not in _CHUNK_FIELDS and k != body_source
+        },
         "timestamp": _utcnow_iso(),
     }
 
@@ -443,16 +625,9 @@ async def graph_enhanced_search(
     qdrant_client = get_qdrant_client()
     vector_name = _get_collection_vector_name(qdrant_client, collection)
 
-    search_kwargs: Dict[str, Any] = {
-        "collection_name": collection,
-        "query": query_embedding,
-        "limit": limit * 2,
-        "with_payload": True,
-    }
-    if vector_name:
-        search_kwargs["using"] = vector_name
-
-    search_results = qdrant_client.query_points(**search_kwargs).points
+    search_results = _search_documents(
+        qdrant_client, collection, query_embedding, limit * 2, vector_name
+    )
 
     if not search_results:
         return {"status": "success", "results": [], "total": 0, "timestamp": _utcnow_iso()}
@@ -460,8 +635,9 @@ async def graph_enhanced_search(
     # 3. Build results map seeded by Qdrant scores
     results_map: Dict[str, Dict[str, Any]] = {}
     for hit in search_results:
-        results_map[str(hit.id)] = {
-            "qdrant_id": str(hit.id),
+        doc_id = _document_id(hit)
+        results_map[doc_id] = {
+            "qdrant_id": doc_id,
             "score": hit.score,
             "boosted_score": hit.score,
             "payload": hit.payload,
@@ -528,6 +704,20 @@ async def graph_enhanced_search(
                 results_map[doc_id]["boosted_score"] += connection_boost
                 results_map[doc_id]["graph_connections"] = entities
 
+    # Graph-discovered documents arrive from Neo4j, which holds no text.
+    graph_ids = [k for k, r in results_map.items() if r["discovered_via_graph"]]
+    if graph_ids:
+        try:
+            points = qdrant_client.retrieve(
+                collection_name=collection, ids=graph_ids, with_payload=True
+            )
+        except Exception as e:
+            # Enrichment only: Neo4j already supplied the title and summary.
+            logger.warning("Excerpt lookup for graph-discovered documents failed: %s", e)
+            points = []
+        for point in points:
+            results_map[str(point.id)]["payload"].update(point.payload or {})
+
     # 5. Rerank by boosted score
     sorted_results = sorted(
         results_map.values(),
@@ -538,12 +728,17 @@ async def graph_enhanced_search(
     # 6. Format output
     formatted_results: List[Dict[str, Any]] = []
     for r in sorted_results:
+        payload = r["payload"] or {}
         result: Dict[str, Any] = {
             "qdrant_id": r["qdrant_id"],
             "original_score": round(r["score"], 4),
             "boosted_score": round(r["boosted_score"], 4),
-            "title": (r["payload"] or {}).get("title", ""),
-            "summary": (r["payload"] or {}).get("summary", ""),
+            "title": payload.get("title", ""),
+            "summary": payload.get("summary", ""),
+            "path": payload.get("path", ""),
+            "excerpt": _excerpt(payload),
+            "chunk_index": payload.get("chunk_index", 0),
+            "chunk_count": payload.get("chunk_count", 1),
             "discovered_via_graph": r["discovered_via_graph"],
         }
         if include_graph_context and r["graph_connections"]:
@@ -1280,9 +1475,15 @@ async def delete_point_tool(
     collection: str,
     point_id: str,
 ) -> Dict[str, Any]:
-    """Delete a single point from a Qdrant collection by id."""
+    """Delete a point from a Qdrant collection by id, with any chunks it owns."""
     client = get_qdrant_client()
     client.delete(collection_name=collection, points_selector=[point_id])
+    client.delete(
+        collection_name=collection,
+        points_selector=Filter(must=[
+            FieldCondition(key="parent_id", match=MatchValue(value=point_id)),
+        ]),
+    )
     return {
         "status": "success",
         "collection": collection,
@@ -1321,6 +1522,23 @@ async def update_payload_tool(
     }
 
 
+def _hybrid_result(hit: Any) -> Dict[str, Any]:
+    """Format one hit. A chunked point's `text` is the excerpt, so it is not repeated;
+    a legacy payload is returned untouched for callers reading its body directly."""
+    payload = hit.payload or {}
+    is_chunked = "chunk_count" in payload
+    return {
+        "id": _document_id(hit),
+        "score": round(hit.score, 4),
+        "title": payload.get("title", ""),
+        "summary": payload.get("summary", ""),
+        "excerpt": _excerpt(payload),
+        "chunk_index": payload.get("chunk_index", 0),
+        "chunk_count": payload.get("chunk_count", 1),
+        "payload": {k: v for k, v in payload.items() if not (is_chunked and k == "text")},
+    }
+
+
 async def hybrid_search_tool(
     query: str,
     collection: str,
@@ -1347,7 +1565,7 @@ async def hybrid_search_tool(
     Returns:
         Dict with results.
     """
-    from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText
+    from qdrant_client.models import MatchText
 
     query_embedding = await get_embedding(query)
     client = get_qdrant_client()
@@ -1362,31 +1580,11 @@ async def hybrid_search_tool(
 
     qfilter = Filter(must=must_conditions) if must_conditions else None
 
-    kwargs: Dict[str, Any] = {
-        "collection_name": collection,
-        "query": query_embedding,
-        "limit": limit,
-        "with_payload": True,
-    }
-    if vector_name:
-        kwargs["using"] = vector_name
-    if qfilter:
-        kwargs["query_filter"] = qfilter
-
-    hits = client.query_points(**kwargs).points
+    hits = _search_documents(client, collection, query_embedding, limit, vector_name, qfilter)
     return {
         "status": "success",
         "collection": collection,
-        "results": [
-            {
-                "id": str(h.id),
-                "score": round(h.score, 4),
-                "title": (h.payload or {}).get("title", ""),
-                "summary": (h.payload or {}).get("summary", ""),
-                "payload": h.payload,
-            }
-            for h in hits
-        ],
+        "results": [_hybrid_result(h) for h in hits],
         "total": len(hits),
         "filtered": bool(must_conditions),
         "timestamp": _utcnow_iso(),
