@@ -23,13 +23,25 @@ Creates a Document node in Neo4j with MENTIONS/REFERENCES edges to Entity nodes,
 and upserts the embedded vector to Qdrant — all in one tool call. Handles both
 named vectors (e.g. `dense`) and unnamed default vectors automatically.
 
-- `text`: Document content for embedding
+- `text`: Document content, stored and embedded in full
 - `collection`: Qdrant collection name
 - `title`: Document title
-- `path`, `summary`, `metadata`: Optional enrichment
+- `path`: The document's identity. Re-storing the same path replaces the document
+- `summary`, `metadata`: Optional enrichment
 - `entities`: `[{name, type, importance}]` — creates Entity nodes linked via MENTIONS
 - `relationships`: `[{target, rel_type, context}]` — creates additional typed edges
-- Returns: `qdrant_id`, `neo4j_id`, entity/relationship counts
+- Returns: `qdrant_id`, `neo4j_id`, entity/relationship counts, `chunks`, `body_chars`
+
+Long text becomes several Qdrant points. Point 0 keeps the id derived from `path`
+and is the document; the rest carry `parent_id`, and each holds its own span in
+`text` with `chunk_index` and `chunk_count`. The spans concatenate to the original
+exactly. Qdrant holds the only copy of the text: the Neo4j Document node keeps the
+summary and the `qdrant_id` that points back.
+
+**`get_doc`** — Read a document's full text back, by `path`, `title` or `qdrant_id`.
+Reassembles chunks, and reads older points that hold their text in `body`,
+`metadata.body` or `_document`. A point stored before bodies were kept returns empty
+`text` with `body_source: null`.
 
 `collection` and `title` are semantically required but carry `""` defaults so the
 call still reaches the server when a malformed tool-call envelope folds them into
@@ -46,7 +58,8 @@ traversal. Documents connected through the knowledge graph get score boosts.
 - `limit`: Max results (default 10)
 - `relationship_boost`: Score boost for graph-connected docs (0.0–0.5, default 0.2)
 - `include_graph_context`: Include entity connections in results
-- Returns: Reranked results with original/boosted scores, `discovered_via_graph` flag
+- Returns: Reranked results, one per document, with original/boosted scores, `excerpt`
+  (the best-matching chunk), `path`, `discovered_via_graph` flag
 
 **`find_related_docs`** — Graph traversal from a known document.
 Finds documents connected to a source document through shared Neo4j entities.

@@ -27,6 +27,7 @@ from .arg_recovery import split_leaked_envelope
 # Import graph-enhanced tools
 from .graph_tools import (
     store_document_with_graph,
+    get_document_tool,
     graph_enhanced_search,
     find_related_documents,
     manage_entities,
@@ -364,17 +365,20 @@ async def store_doc_with_graph(
     Store document in Qdrant with Neo4j graph cross-reference.
 
     Args:
-        text: Document content for embedding
+        text: Document content. Stored in full and embedded in full; long text
+            is split into chunks, and get_doc reads it back whole.
         collection: Qdrant collection name (always supply this)
         title: Document title (always supply this)
-        path: Optional file path
+        path: Optional file path. This is the document's identity: re-storing
+            the same path replaces the document, including any longer version.
         summary: Optional brief summary
         metadata: Additional metadata for Qdrant
         entities: List of entities [{name, type, importance}]
         relationships: List of relationships [{target, rel_type, context}]
 
     Returns:
-        qdrant_id, neo4j_id, entities_created, relationships_created
+        qdrant_id, neo4j_id, entities_created, relationships_created, chunks,
+        body_chars
     """
     supplied = {
         "collection": collection,
@@ -423,6 +427,34 @@ async def store_doc_with_graph(
 
 
 @mcp.tool()
+async def get_doc(
+    collection: str,
+    path: Optional[str] = None,
+    title: Optional[str] = None,
+    qdrant_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Read a stored document's full text back. Search results carry an excerpt;
+    use this for the whole document.
+
+    Args:
+        collection: Qdrant collection name
+        path: The path it was stored under
+        title: The title it was stored under, for a document with no path
+        qdrant_id: The id from a store or search result; wins over path and title
+
+    Returns:
+        text, body_source, complete, chunk_count, title, path, summary and the
+        remaining payload. status is "not_found" when no such document exists.
+        body_source None with empty text means the point was stored before
+        bodies were kept, so only its summary survives.
+    """
+    return await get_document_tool(
+        collection=collection, path=path, title=title, qdrant_id=qdrant_id
+    )
+
+
+@mcp.tool()
 async def search_with_graph(
     query: str,
     collection: str,
@@ -441,7 +473,8 @@ async def search_with_graph(
         include_graph_context: Include entity connections in results
     
     Returns:
-        Reranked results with graph context
+        Reranked results with graph context, one per document. Each carries an
+        excerpt: the best-matching chunk. Use get_doc for the full text.
     """
     return await graph_enhanced_search(
         query=query,
@@ -722,6 +755,9 @@ async def hybrid_search(
     collection config). Accepts a title substring filter and a payload-equality
     map applied server-side by Qdrant. For a pure vector query, omit both
     filter arguments.
+
+    Returns one result per document, each with an excerpt: the best-matching
+    chunk. Use get_doc for the full text.
     """
     return await hybrid_search_tool(
         query=query,
